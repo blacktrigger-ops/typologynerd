@@ -1,15 +1,15 @@
-
 import os
 import asyncio
 from datetime import datetime
 from typing import List, Optional
-from pydantic import Field
+
 import discord
 from discord import ui
 from discord.ext import commands
 from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo.errors import DuplicateKeyError
+from pymongo import IndexModel
 from beanie import Document, Indexed, init_beanie
+from pydantic import Field  # This was missing
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -17,22 +17,22 @@ load_dotenv()
 
 # --- Database Models ---
 class PersistentDefinition(Document):
-    term: Indexed(str)
+    term: str = Indexed(str)
     text: str
     author_id: int
     author_name: str
-    reference: str = ""
-    votes: int = 0
-    voters: List[int] = Field(default_factory=list)  # Track who voted
+    reference: str = Field(default="")  # Now properly using Field
+    votes: int = Field(default=0)
+    voters: List[int] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=datetime.utcnow)
     last_updated: datetime = Field(default_factory=datetime.utcnow)
     
     class Settings:
         name = "typology_definitions"
         indexes = [
-            [("term", "text"), {"name": "term_text_search"}],
-            [("term", "-votes"), {"name": "term_popularity"}],
-            [("voters"), {"name": "voter_lookup"}]
+            IndexModel([("term", "text")], name="term_text_search"),
+            IndexModel([("term", -1), ("votes", -1)], name="term_popularity"),
+            IndexModel([("voters", 1)], name="voter_lookup")
         ]
 
     async def add_vote(self, user_id: int, value: int) -> bool:
@@ -158,13 +158,17 @@ class TypologyBot(commands.Bot):
         
     async def setup_hook(self):
         """Initialize database connection"""
-        self.mongo_client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
-        await init_beanie(
-            database=self.mongo_client[os.getenv("MONGO_DB", "typology_bot")],
-            document_models=[PersistentDefinition]
-        )
-        self.ready = True
-        print("Database connection established")
+        try:
+            self.mongo_client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
+            await init_beanie(
+                database=self.mongo_client[os.getenv("MONGO_DB", "typology_bot")],
+                document_models=[PersistentDefinition]
+            )
+            self.ready = True
+            print("✅ Database connection established")
+        except Exception as e:
+            print(f"❌ Database connection failed: {e}")
+            raise
 
     async def close(self):
         """Cleanup on bot shutdown"""
@@ -182,27 +186,30 @@ async def define(ctx, term: str):
     if not bot.ready:
         return await ctx.send("🔄 Bot is initializing, please wait...")
     
-    definitions = await PersistentDefinition.find(
-        PersistentDefinition.term == term.upper()
-    ).sort(-PersistentDefinition.votes).to_list()
-    
-    if not definitions:
-        embed = discord.Embed(
-            title=f"No persistent definitions found for {term.upper()}",
-            description=f"Use `{bot.command_prefix}add {term} [definition]` to add one!",
-            color=0xE74C3C
+    try:
+        definitions = await PersistentDefinition.find(
+            PersistentDefinition.term == term.upper()
+        ).sort(-PersistentDefinition.votes).to_list()
+        
+        if not definitions:
+            embed = discord.Embed(
+                title=f"No persistent definitions found for {term.upper()}",
+                description=f"Use `{bot.command_prefix}add {term} [definition]` to add one!",
+                color=0xE74C3C
+            )
+            return await ctx.send(embed=embed)
+        
+        view = DefinitionPaginator(definitions, term)
+        view.message = await ctx.send(
+            embed=discord.Embed(
+                title=f"Loading {term.upper()} definitions...",
+                color=0x6A0DAD
+            ),
+            view=view
         )
-        return await ctx.send(embed=embed)
-    
-    view = DefinitionPaginator(definitions, term)
-    view.message = await ctx.send(
-        embed=discord.Embed(
-            title=f"Loading {term.upper()} definitions...",
-            color=0x6A0DAD
-        ),
-        view=view
-    )
-    await view.update_embed()
+        await view.update_embed()
+    except Exception as e:
+        await ctx.send(f"❌ Error loading definitions: {str(e)}")
 
 @bot.command()
 async def add(ctx, term: str, *, definition: str):
@@ -210,17 +217,18 @@ async def add(ctx, term: str, *, definition: str):
     if not bot.ready:
         return await ctx.send("🔄 Bot is initializing, please wait...")
     
-    if len(definition) > 1000:
-        return await ctx.send("❌ Definition too long (max 1000 characters)")
-    
     try:
-        new_def = await PersistentDefinition(
+        if len(definition) > 1000:
+            return await ctx.send("❌ Definition too long (max 1000 characters)")
+        
+        new_def = PersistentDefinition(
             term=term.upper(),
             text=definition,
             author_id=ctx.author.id,
             author_name=str(ctx.author),
-            voters=[ctx.author.id]  # Auto-upvote own definition
-        ).insert()
+            voters=[ctx.author.id]  # Auto-upvote
+        )
+        await new_def.insert()
         
         embed = discord.Embed(
             title=f"✅ Persistent definition added for {term.upper()}",
@@ -230,39 +238,8 @@ async def add(ctx, term: str, *, definition: str):
         embed.set_author(name=ctx.author.display_name, icon_url=ctx.author.display_avatar.url)
         embed.set_footer(text=f"Use {bot.command_prefix}define {term} to view")
         await ctx.send(embed=embed)
-        
-    except DuplicateKeyError:
-        await ctx.send("❌ Similar definition already exists!")
-
-@bot.command()
-async def search(ctx, *, query: str):
-    """Search persistent definitions"""
-    if not bot.ready:
-        return await ctx.send("🔄 Bot is initializing, please wait...")
-    
-    # Ensure text index exists
-    await PersistentDefinition.get_motor_collection().create_index([("text", "text")])
-    
-    results = await PersistentDefinition.find(
-        {"$text": {"$search": query}}
-    ).sort(-PersistentDefinition.votes).limit(5).to_list()
-    
-    if not results:
-        return await ctx.send("🔍 No results found")
-    
-    embed = discord.Embed(
-        title=f"🔍 Search Results for '{query}'",
-        color=0x3498DB
-    )
-    
-    for result in results:
-        embed.add_field(
-            name=f"{result.term.upper()} (⭐ {result.votes})",
-            value=f"{result.text[:150]}...\n[View all]({ctx.message.jump_url})",
-            inline=False
-        )
-    
-    await ctx.send(embed=embed)
+    except Exception as e:
+        await ctx.send(f"❌ Error adding definition: {str(e)}")
 
 # --- Error Handling ---
 @bot.event
@@ -287,6 +264,7 @@ async def on_command_error(ctx, error):
 
 # --- Startup ---
 if __name__ == "__main__":
+    # Verify required environment variables
     required_vars = ["DISCORD_TOKEN", "MONGO_URI"]
     missing_vars = [var for var in required_vars if not os.getenv(var)]
     
@@ -294,4 +272,7 @@ if __name__ == "__main__":
         print(f"❌ Missing environment variables: {', '.join(missing_vars)}")
         exit(1)
     
-    bot.run(os.getenv("DISCORD_TOKEN"))
+    try:
+        bot.run(os.getenv("DISCORD_TOKEN"))
+    except Exception as e:
+        print(f"❌ Bot crashed: {e}")
