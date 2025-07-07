@@ -1,9 +1,7 @@
 import os
-import re
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List, Optional
-
 import discord
 from discord import ui
 from discord.ext import commands
@@ -13,15 +11,17 @@ from beanie import Document, init_beanie
 from pydantic import Field
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
-# --- Database Model ---
+# ======================
+# DATABASE MODEL
+# ======================
 class TypologyDefinition(Document):
     term: str
     text: str
     author_id: int
     author_name: str
+    categorizer_id: int
     reference: str = Field(default="")
     votes: int = Field(default=0)
     voters: List[int] = Field(default_factory=list)
@@ -31,19 +31,66 @@ class TypologyDefinition(Document):
     class Settings:
         name = "typology_definitions"
         indexes = [
-            IndexModel([("term", "text")]),  # Search index
-            IndexModel([("term", -1), ("votes", -1)]),  # Popularity sorting
-            IndexModel([("voters", 1)]),  # Vote tracking
-            IndexModel([("author_id", 1)])  # Author lookup
+            IndexModel([("term", "text")], name="term_text_idx"),
+            IndexModel([("term", -1), ("votes", -1)], name="popularity_idx"),
+            IndexModel([("author_id", 1)], name="author_idx"),
+            IndexModel([("categorizer_id", 1)], name="categorizer_idx")
         ]
 
-# --- Interactive UI ---
+# ======================
+# DATABASE INITIALIZATION
+# ======================
+async def initialize_database():
+    client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
+    db = client[os.getenv("MONGO_DB", "typology_bot")]
+    
+    # Initialize Beanie without auto-indexing
+    await init_beanie(
+        database=db,
+        document_models=[TypologyDefinition],
+        allow_index_dropping=False
+    )
+    
+    # Manual index management to prevent conflicts
+    collection = db["typology_definitions"]
+    existing_indexes = await collection.index_information()
+    
+    for index in TypologyDefinition.Settings.indexes:
+        index_name = index.document["name"]
+        index_keys = tuple(index.document["key"].items())
+        
+        # Check for existing index with same keys but different name
+        conflict_exists = False
+        for existing_name, existing_info in existing_indexes.items():
+            if existing_name == "_id_":
+                continue
+                
+            existing_keys = tuple((k, v) for k, v in existing_info["key"])
+            if existing_keys == index_keys and existing_name != index_name:
+                conflict_exists = True
+                try:
+                    await collection.drop_index(existing_name)
+                    print(f"♻️ Dropped conflicting index: {existing_name}")
+                except Exception as e:
+                    print(f"⚠️ Failed to drop index {existing_name}: {str(e)}")
+                break
+        
+        # Create index if needed
+        if index_name not in existing_indexes or conflict_exists:
+            try:
+                await collection.create_indexes([index])
+                print(f"✅ Created index: {index_name}")
+            except Exception as e:
+                print(f"⚠️ Failed to create index {index_name}: {str(e)}")
+
+# ======================
+# INTERACTIVE UI
+# ======================
 class DefinitionView(ui.View):
-    def __init__(self, definitions: List[TypologyDefinition], term: str, author_id: int):
+    def __init__(self, definitions: List[TypologyDefinition], user_id: int):
         super().__init__(timeout=120.0)
         self.definitions = definitions
-        self.term = term
-        self.author_id = author_id
+        self.user_id = user_id
         self.page = 0
         self.per_page = 5
         self.message = None
@@ -53,7 +100,7 @@ class DefinitionView(ui.View):
         page_defs = self.definitions[start:start+self.per_page]
         
         embed = discord.Embed(
-            title=f"📖 {self.term} Definitions (Page {self.page + 1})",
+            title=f"📖 {self.definitions[0].term} Definitions (Page {self.page + 1})",
             color=0x6A0DAD,
             timestamp=datetime.utcnow()
         )
@@ -63,9 +110,10 @@ class DefinitionView(ui.View):
                 name=f"#{start + idx} (⭐ {defn.votes})",
                 value=(
                     f"{defn.text}\n\n"
-                    f"↳ *By {defn.author_name}*\n"
-                    f"↳ *Reference: {defn.reference or 'None'}*\n"
-                    f"↳ *Updated {discord.utils.format_dt(defn.last_updated, style='R')}*"
+                    f"↳ By {defn.author_name}\n"
+                    f"↳ Categorized by {await self.fetch_username(defn.categorizer_id)}\n"
+                    f"↳ Reference: {defn.reference or 'None'}\n"
+                    f"↳ Updated {discord.utils.format_dt(defn.last_updated, style='R')}"
                 ),
                 inline=False
             )
@@ -74,6 +122,13 @@ class DefinitionView(ui.View):
             await interaction.response.edit_message(embed=embed, view=self)
         elif self.message:
             await self.message.edit(embed=embed, view=self)
+
+    async def fetch_username(self, user_id: int) -> str:
+        try:
+            user = await bot.fetch_user(user_id)
+            return user.display_name
+        except:
+            return "Unknown User"
 
     @ui.button(emoji="⬅️", style=discord.ButtonStyle.blurple)
     async def prev_page(self, interaction: discord.Interaction, button: ui.Button):
@@ -88,11 +143,7 @@ class DefinitionView(ui.View):
 
     @ui.button(emoji="⭐", style=discord.ButtonStyle.green)
     async def upvote(self, interaction: discord.Interaction, button: ui.Button):
-        definition_idx = self.page * self.per_page
-        if definition_idx >= len(self.definitions):
-            return
-            
-        definition = self.definitions[definition_idx]
+        definition = self.definitions[self.page * self.per_page]
         
         if interaction.user.id in definition.voters:
             await interaction.response.send_message("❌ You've already voted!", ephemeral=True)
@@ -108,30 +159,38 @@ class DefinitionView(ui.View):
 
     @ui.button(emoji="✏️", style=discord.ButtonStyle.gray)
     async def edit_btn(self, interaction: discord.Interaction, button: ui.Button):
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message("❌ You can only edit your own definitions", ephemeral=True)
+        definition = self.definitions[self.page * self.per_page]
+        
+        if interaction.user.id != definition.author_id:
+            await interaction.response.send_message(
+                "❌ You can only edit your own definitions", 
+                ephemeral=True
+            )
             return
             
-        definition_idx = self.page * self.per_page
-        definition = self.definitions[definition_idx]
-        
         modal = EditModal(definition)
         await interaction.response.send_modal(modal)
 
     @ui.button(emoji="🗑️", style=discord.ButtonStyle.red)
     async def delete_btn(self, interaction: discord.Interaction, button: ui.Button):
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message("❌ You can only delete your own definitions", ephemeral=True)
+        definition = self.definitions[self.page * self.per_page]
+        
+        if interaction.user.id != definition.author_id:
+            await interaction.response.send_message(
+                "❌ You can only delete your own definitions", 
+                ephemeral=True
+            )
             return
             
-        definition_idx = self.page * self.per_page
-        definition = self.definitions[definition_idx]
-        
         await definition.delete()
-        self.definitions.pop(definition_idx)
+        self.definitions.pop(self.page * self.per_page)
         
         if not self.definitions:
-            await interaction.response.edit_message(content=f"✅ All definitions for {self.term} deleted", embed=None, view=None)
+            await interaction.response.edit_message(
+                content=f"✅ All definitions for {definition.term} deleted",
+                embed=None,
+                view=None
+            )
             return
             
         await interaction.response.send_message("✅ Definition deleted", ephemeral=True)
@@ -157,48 +216,100 @@ class EditModal(ui.Modal, title="Edit Definition"):
         await self.definition.save()
         await interaction.response.send_message("✅ Definition updated!", ephemeral=True)
 
-# --- Bot Setup ---
+# ======================
+# BOT SETUP
+# ======================
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# --- Database Connection ---
-async def init_db():
-    client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
-    await init_beanie(
-        database=client[os.getenv("MONGO_DB", "typology_bot")],
-        document_models=[TypologyDefinition]
-    )
-    
-    # Manual index conflict resolution
-    db = client[os.getenv("MONGO_DB", "typology_bot")]
-    collection = db["typology_definitions"]
-    
-    existing_indexes = await collection.index_information()
-    
-    # Create only missing indexes
-    for index in TypologyDefinition.Settings.indexes:
-        index_keys = tuple(index.document["key"].items())
-        exists = False
-        
-        for existing_info in existing_indexes.values():
-            if existing_info["key"] == list(index_keys):
-                exists = True
-                break
-                
-        if not exists:
-            await collection.create_indexes([index])
-
-# --- Commands ---
 @bot.event
 async def on_ready():
-    try:
-        await init_db()
-        print(f"✅ Bot ready as {bot.user}")
-    except Exception as e:
-        print(f"❌ Database initialization failed: {str(e)}")
-        raise
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"🔄 Database initialization attempt {attempt}/3")
+            await initialize_database()
+            print(f"✅ Bot ready as {bot.user}")
+            break
+        except Exception as e:
+            print(f"❌ Attempt {attempt} failed: {str(e)}")
+            if attempt == 3:
+                print("💥 Failed to initialize database after 3 attempts")
+                raise
+            await asyncio.sleep(2 ** attempt)
 
+# ======================
+# MESSAGE HANDLING
+# ======================
+@bot.event
+async def on_message(message):
+    await bot.process_commands(message)
+    
+    if (
+        message.reference and
+        message.content.lower().startswith("tp define") and
+        not message.author.bot
+    ):
+        try:
+            # Fetch original message
+            original = await message.channel.fetch_message(message.reference.message_id)
+            if original.author.bot:
+                return
+                
+            # Parse command
+            parts = message.content.split(maxsplit=3)
+            if len(parts) < 3:
+                await message.channel.send("❌ Format: `tp define TERM @author [reference]`")
+                return
+                
+            term = parts[2].upper()
+            author = message.mentions[0] if message.mentions else original.author
+            reference = parts[3].split("@")[0].strip() if len(parts) > 3 else ""
+            
+            # Check for duplicates
+            exists = await TypologyDefinition.find(
+                TypologyDefinition.term == term,
+                TypologyDefinition.text == original.content,
+                TypologyDefinition.author_id == author.id
+            ).first_or_none()
+            
+            if exists:
+                await message.channel.send("⚠️ This definition already exists!")
+                return
+                
+            # Create definition
+            definition = TypologyDefinition(
+                term=term,
+                text=original.content,
+                author_id=author.id,
+                author_name=str(author),
+                categorizer_id=message.author.id,
+                reference=reference,
+                voters=[author.id, message.author.id]
+            )
+            await definition.insert()
+            
+            # Send confirmation
+            embed = discord.Embed(
+                title=f"✅ Definition saved for {term}",
+                description=original.content,
+                color=0x00ff00
+            )
+            embed.add_field(name="Author", value=author.display_name)
+            embed.add_field(name="Categorized by", value=message.author.display_name)
+            if reference:
+                embed.add_field(name="Reference", value=reference)
+                
+            await message.channel.send(embed=embed)
+            
+        except Exception as e:
+            await message.channel.send(f"❌ Error: {str(e)}")
+
+# ======================
+# COMMANDS
+# ======================
 @bot.command()
 async def define(ctx, term: str):
     """View definitions with interactive controls"""
@@ -210,33 +321,16 @@ async def define(ctx, term: str):
         if not definitions:
             await ctx.send(f"❌ No definitions found for {term.upper()}")
             return
-        
-        view = DefinitionView(definitions, term.upper(), ctx.author.id)
+            
+        view = DefinitionView(definitions, ctx.author.id)
         view.message = await ctx.send(
-            embed=discord.Embed(title=f"Loading {term.upper()}...", color=0x6A0DAD),
+            embed=discord.Embed(
+                title=f"Loading {term.upper()} definitions...",
+                color=0x6A0DAD
+            ),
             view=view
         )
         await view.update_embed()
-    except Exception as e:
-        await ctx.send(f"❌ Error: {str(e)}")
-
-@bot.command()
-async def add(ctx, term: str, *, definition: str):
-    """Add a new definition"""
-    try:
-        if len(definition) > 2000:
-            await ctx.send("❌ Definition too long (max 2000 chars)")
-            return
-        
-        new_def = TypologyDefinition(
-            term=term.upper(),
-            text=definition,
-            author_id=ctx.author.id,
-            author_name=str(ctx.author),
-            voters=[ctx.author.id]  # Auto-upvote
-        )
-        await new_def.insert()
-        await ctx.send(f"✅ Added definition for {term.upper()}!")
     except Exception as e:
         await ctx.send(f"❌ Error: {str(e)}")
 
@@ -251,8 +345,8 @@ async def search(ctx, *, query: str):
         if not results:
             await ctx.send("🔍 No results found")
             return
-        
-        embed = discord.Embed(title=f"🔍 Search Results", color=0x3498DB)
+            
+        embed = discord.Embed(title="🔍 Search Results", color=0x3498DB)
         for result in results:
             embed.add_field(
                 name=f"{result.term} (⭐ {result.votes})",
@@ -263,11 +357,16 @@ async def search(ctx, *, query: str):
     except Exception as e:
         await ctx.send(f"❌ Search error: {str(e)}")
 
-# --- Run Bot ---
+# ======================
+# START BOT
+# ======================
 if __name__ == "__main__":
     required_vars = ["DISCORD_TOKEN", "MONGO_URI"]
     if missing := [var for var in required_vars if not os.getenv(var)]:
-        print(f"❌ Missing env vars: {', '.join(missing)}")
+        print(f"❌ Missing environment variables: {', '.join(missing)}")
         exit(1)
     
-    bot.run(os.getenv("DISCORD_TOKEN"))
+    try:
+        bot.run(os.getenv("DISCORD_TOKEN"))
+    except Exception as e:
+        print(f"💥 Bot crashed: {str(e)}")
