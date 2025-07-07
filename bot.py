@@ -1,8 +1,6 @@
-
 import os
-import re
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List, Optional
 
 import discord
@@ -10,7 +8,7 @@ from discord import ui
 from discord.ext import commands
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import IndexModel
-from beanie import Document, Indexed, init_beanie
+from beanie import Document, init_beanie
 from pydantic import Field
 from dotenv import load_dotenv
 
@@ -19,7 +17,7 @@ load_dotenv()
 
 # --- Database Model ---
 class TypologyDefinition(Document):
-    term: str = Indexed(str)
+    term: str
     text: str
     author_id: int
     author_name: str
@@ -38,8 +36,50 @@ class TypologyDefinition(Document):
             IndexModel([("author_id", 1)], name="author_definitions")
         ]
 
+# --- Bot Setup ---
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# --- Database Connection ---
+async def init_db():
+    client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
+    await init_beanie(
+        database=client[os.getenv("MONGO_DB", "typology_bot")],
+        document_models=[TypologyDefinition]
+    )
+    
+    # Manually handle index creation to avoid conflicts
+    collection = client[os.getenv("MONGO_DB", "typology_bot")]["typology_definitions"]
+    
+    # First drop conflicting indexes if they exist
+    existing_indexes = await collection.index_information()
+    index_names_to_drop = []
+    
+    # Check for indexes with same keys but different names
+    for idx_name, idx_info in existing_indexes.items():
+        if idx_name == "_id_":
+            continue
+            
+        idx_keys = tuple((k, v) for k, v in idx_info["key"])
+        
+        for model_idx in TypologyDefinition.Settings.indexes:
+            model_keys = tuple((k, v) for k, v in model_idx.document["key"].items())
+            if idx_keys == model_keys and idx_name != model_idx.document["name"]:
+                index_names_to_drop.append(idx_name)
+    
+    # Drop conflicting indexes
+    for idx_name in index_names_to_drop:
+        try:
+            await collection.drop_index(idx_name)
+        except Exception as e:
+            print(f"⚠️ Couldn't drop index {idx_name}: {str(e)}")
+    
+    # Create new indexes
+    await collection.create_indexes(TypologyDefinition.Settings.indexes)
+
 # --- Interactive UI ---
-class DefinitionPaginator(ui.View):
+class DefinitionView(ui.View):
     def __init__(self, definitions: List[TypologyDefinition], term: str, author_id: int):
         super().__init__(timeout=120.0)
         self.definitions = definitions
@@ -59,15 +99,14 @@ class DefinitionPaginator(ui.View):
         )
         
         for idx, defn in enumerate(page_defs, 1):
-            field_value = f"{defn.text}\n\n⭐ **Votes:** {defn.votes}"
-            if defn.reference:
-                field_value += f"\n📚 **Reference:** {defn.reference}"
-            field_value += f"\n👤 **Author:** {defn.author_name}"
-            field_value += f"\n⏱️ **Last Updated:** {discord.utils.format_dt(defn.last_updated, style='R')}"
-            
             embed.add_field(
-                name=f"Definition #{start + idx}",
-                value=field_value,
+                name=f"Definition #{start + idx} (⭐ {defn.votes})",
+                value=(
+                    f"{defn.text}\n\n"
+                    f"↳ *By {defn.author_name}*\n"
+                    f"↳ *Reference: {defn.reference or 'None'}*\n"
+                    f"↳ *Updated {discord.utils.format_dt(defn.last_updated, style='R')}*"
+                ),
                 inline=False
             )
         
@@ -158,51 +197,45 @@ class EditModal(ui.Modal, title="Edit Definition"):
         await self.definition.save()
         await interaction.response.send_message("✅ Definition updated!", ephemeral=True)
 
-# --- Bot Setup ---
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-# --- Database Connection ---
-async def init_db():
-    client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
-    await init_beanie(
-        database=client[os.getenv("MONGO_DB", "typology_bot")],
-        document_models=[TypologyDefinition]
-    )
-
-# --- Commands ---
+# --- Bot Commands ---
 @bot.event
 async def on_ready():
-    await init_db()
-    print(f"✅ Bot ready as {bot.user}")
+    try:
+        await init_db()
+        print(f"✅ Bot ready as {bot.user}")
+    except Exception as e:
+        print(f"❌ Database initialization failed: {str(e)}")
+        raise
 
 @bot.command()
 async def define(ctx, term: str):
     """View definitions with interactive controls"""
-    definitions = await TypologyDefinition.find(
-        TypologyDefinition.term == term.upper()
-    ).sort(-TypologyDefinition.votes).to_list()
-    
-    if not definitions:
-        await ctx.send(f"❌ No definitions found for {term.upper()}")
-        return
-    
-    view = DefinitionPaginator(definitions, term.upper(), ctx.author.id)
-    view.message = await ctx.send(
-        embed=discord.Embed(title=f"Loading {term.upper()}...", color=0x6A0DAD),
-        view=view
-    )
-    await view.update_embed()
+    try:
+        definitions = await TypologyDefinition.find(
+            TypologyDefinition.term == term.upper()
+        ).sort(-TypologyDefinition.votes).to_list()
+        
+        if not definitions:
+            await ctx.send(f"❌ No definitions found for {term.upper()}")
+            return
+        
+        view = DefinitionView(definitions, term.upper(), ctx.author.id)
+        view.message = await ctx.send(
+            embed=discord.Embed(title=f"Loading {term.upper()}...", color=0x6A0DAD),
+            view=view
+        )
+        await view.update_embed()
+    except Exception as e:
+        await ctx.send(f"❌ Error: {str(e)}")
 
 @bot.command()
 async def add(ctx, term: str, *, definition: str):
     """Add a new definition"""
-    if len(definition) > 2000:
-        await ctx.send("❌ Definition too long (max 2000 chars)")
-        return
-    
     try:
+        if len(definition) > 2000:
+            await ctx.send("❌ Definition too long (max 2000 chars)")
+            return
+        
         new_def = TypologyDefinition(
             term=term.upper(),
             text=definition,
@@ -222,4 +255,7 @@ if __name__ == "__main__":
         print(f"❌ Missing env vars: {', '.join(missing)}")
         exit(1)
     
-    bot.run(os.getenv("DISCORD_TOKEN"))
+    try:
+        bot.run(os.getenv("DISCORD_TOKEN"))
+    except Exception as e:
+        print(f"❌ Bot crashed: {str(e)}")
