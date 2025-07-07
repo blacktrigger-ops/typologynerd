@@ -10,7 +10,7 @@ from pymongo import IndexModel
 from beanie import Document, init_beanie
 from pydantic import Field
 from dotenv import load_dotenv
-from pymongo IMPORT TEXT
+from pymongo import TEXT
 load_dotenv()
 
 # ======================
