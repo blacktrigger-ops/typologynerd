@@ -34,7 +34,7 @@ class TypologyDefinition(Document):
             IndexModel([("term", "text")], name="term_text_idx"),
             IndexModel([("term", -1), ("votes", -1)], name="popularity_idx"),
             IndexModel([("author_id", 1)], name="author_idx"),
-            IndexModel([("categorizer_id", 1), name="categorizer_idx"),
+            IndexModel([("categorizer_id", 1)], name="categorizer_idx"),
 IndexModel([("term", TEXT), ("text", TEXT)], name="term_text_search")
         ]
 
