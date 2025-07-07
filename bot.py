@@ -1,6 +1,7 @@
 import os
+import re
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
 
 import discord
@@ -30,53 +31,11 @@ class TypologyDefinition(Document):
     class Settings:
         name = "typology_definitions"
         indexes = [
-            IndexModel([("term", "text")], name="term_text_search"),
-            IndexModel([("term", -1), ("votes", -1)], name="term_popularity"),
-            IndexModel([("voters", 1)], name="voter_lookup"),
-            IndexModel([("author_id", 1)], name="author_definitions")
+            IndexModel([("term", "text")]),  # Search index
+            IndexModel([("term", -1), ("votes", -1)]),  # Popularity sorting
+            IndexModel([("voters", 1)]),  # Vote tracking
+            IndexModel([("author_id", 1)])  # Author lookup
         ]
-
-# --- Bot Setup ---
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-# --- Database Connection ---
-async def init_db():
-    client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
-    await init_beanie(
-        database=client[os.getenv("MONGO_DB", "typology_bot")],
-        document_models=[TypologyDefinition]
-    )
-    
-    # Manually handle index creation to avoid conflicts
-    collection = client[os.getenv("MONGO_DB", "typology_bot")]["typology_definitions"]
-    
-    # First drop conflicting indexes if they exist
-    existing_indexes = await collection.index_information()
-    index_names_to_drop = []
-    
-    # Check for indexes with same keys but different names
-    for idx_name, idx_info in existing_indexes.items():
-        if idx_name == "_id_":
-            continue
-            
-        idx_keys = tuple((k, v) for k, v in idx_info["key"])
-        
-        for model_idx in TypologyDefinition.Settings.indexes:
-            model_keys = tuple((k, v) for k, v in model_idx.document["key"].items())
-            if idx_keys == model_keys and idx_name != model_idx.document["name"]:
-                index_names_to_drop.append(idx_name)
-    
-    # Drop conflicting indexes
-    for idx_name in index_names_to_drop:
-        try:
-            await collection.drop_index(idx_name)
-        except Exception as e:
-            print(f"⚠️ Couldn't drop index {idx_name}: {str(e)}")
-    
-    # Create new indexes
-    await collection.create_indexes(TypologyDefinition.Settings.indexes)
 
 # --- Interactive UI ---
 class DefinitionView(ui.View):
@@ -95,12 +54,13 @@ class DefinitionView(ui.View):
         
         embed = discord.Embed(
             title=f"📖 {self.term} Definitions (Page {self.page + 1})",
-            color=0x6A0DAD
+            color=0x6A0DAD,
+            timestamp=datetime.utcnow()
         )
         
         for idx, defn in enumerate(page_defs, 1):
             embed.add_field(
-                name=f"Definition #{start + idx} (⭐ {defn.votes})",
+                name=f"#{start + idx} (⭐ {defn.votes})",
                 value=(
                     f"{defn.text}\n\n"
                     f"↳ *By {defn.author_name}*\n"
@@ -197,7 +157,39 @@ class EditModal(ui.Modal, title="Edit Definition"):
         await self.definition.save()
         await interaction.response.send_message("✅ Definition updated!", ephemeral=True)
 
-# --- Bot Commands ---
+# --- Bot Setup ---
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# --- Database Connection ---
+async def init_db():
+    client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
+    await init_beanie(
+        database=client[os.getenv("MONGO_DB", "typology_bot")],
+        document_models=[TypologyDefinition]
+    )
+    
+    # Manual index conflict resolution
+    db = client[os.getenv("MONGO_DB", "typology_bot")]
+    collection = db["typology_definitions"]
+    
+    existing_indexes = await collection.index_information()
+    
+    # Create only missing indexes
+    for index in TypologyDefinition.Settings.indexes:
+        index_keys = tuple(index.document["key"].items())
+        exists = False
+        
+        for existing_info in existing_indexes.values():
+            if existing_info["key"] == list(index_keys):
+                exists = True
+                break
+                
+        if not exists:
+            await collection.create_indexes([index])
+
+# --- Commands ---
 @bot.event
 async def on_ready():
     try:
@@ -248,6 +240,29 @@ async def add(ctx, term: str, *, definition: str):
     except Exception as e:
         await ctx.send(f"❌ Error: {str(e)}")
 
+@bot.command()
+async def search(ctx, *, query: str):
+    """Search across all definitions"""
+    try:
+        results = await TypologyDefinition.find(
+            {"$text": {"$search": query}}
+        ).sort(-TypologyDefinition.votes).limit(5).to_list()
+        
+        if not results:
+            await ctx.send("🔍 No results found")
+            return
+        
+        embed = discord.Embed(title=f"🔍 Search Results", color=0x3498DB)
+        for result in results:
+            embed.add_field(
+                name=f"{result.term} (⭐ {result.votes})",
+                value=f"{result.text[:150]}...",
+                inline=False
+            )
+        await ctx.send(embed=embed)
+    except Exception as e:
+        await ctx.send(f"❌ Search error: {str(e)}")
+
 # --- Run Bot ---
 if __name__ == "__main__":
     required_vars = ["DISCORD_TOKEN", "MONGO_URI"]
@@ -255,7 +270,4 @@ if __name__ == "__main__":
         print(f"❌ Missing env vars: {', '.join(missing)}")
         exit(1)
     
-    try:
-        bot.run(os.getenv("DISCORD_TOKEN"))
-    except Exception as e:
-        print(f"❌ Bot crashed: {str(e)}")
+    bot.run(os.getenv("DISCORD_TOKEN"))
