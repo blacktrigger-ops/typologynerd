@@ -10,7 +10,7 @@ from pymongo import IndexModel
 from beanie import Document, init_beanie
 from pydantic import Field
 from dotenv import load_dotenv
-
+from pymongo IMPORT TEXT
 load_dotenv()
 
 # ======================
@@ -34,12 +34,14 @@ class TypologyDefinition(Document):
             IndexModel([("term", "text")], name="term_text_idx"),
             IndexModel([("term", -1), ("votes", -1)], name="popularity_idx"),
             IndexModel([("author_id", 1)], name="author_idx"),
-            IndexModel([("categorizer_id", 1)], name="categorizer_idx")
+            IndexModel([("categorizer_id", 1),
+IndexModel([("term", TEXT), ("text", TEXT)], name="term_text_search")], name="categorizer_idx")
         ]
 
 # ======================
 # DATABASE INITIALIZATION
 # ======================
+
 async def initialize_database():
     client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
     db = client[os.getenv("MONGO_DB", "typology_bot")]
@@ -48,7 +50,8 @@ async def initialize_database():
     await init_beanie(
         database=db,
         document_models=[TypologyDefinition],
-        allow_index_dropping=False
+        allow_index_dropping=False,
+        create_indexes=False  # CRITICAL FIX: Disable auto-index creation
     )
     
     # Manual index management to prevent conflicts
@@ -57,7 +60,7 @@ async def initialize_database():
     
     for index in TypologyDefinition.Settings.indexes:
         index_name = index.document["name"]
-        index_keys = tuple(index.document["key"].items())
+        index_keys = tuple(index.document["key"])
         
         # Check for existing index with same keys but different name
         conflict_exists = False
@@ -65,24 +68,30 @@ async def initialize_database():
             if existing_name == "_id_":
                 continue
                 
-            existing_keys = tuple((k, v) for k, v in existing_info["key"])
-            if existing_keys == index_keys and existing_name != index_name:
+            # Handle both list and tuple representations
+            existing_keys = tuple(existing_info["key"])
+            if isinstance(existing_keys[0], tuple):
+                existing_keys = tuple((k, v) for k, v in existing_keys)
+            else:
+                existing_keys = tuple(existing_keys)
+                
+            # Compare normalized key sets
+            if set(existing_keys) == set(index_keys) and existing_name != index_name:
                 conflict_exists = True
                 try:
                     await collection.drop_index(existing_name)
                     print(f"♻️ Dropped conflicting index: {existing_name}")
+                    break  # Only need to handle one conflict per index
                 except Exception as e:
                     print(f"⚠️ Failed to drop index {existing_name}: {str(e)}")
-                break
         
-        # Create index if needed
-        if index_name not in existing_indexes or conflict_exists:
+        # Create index if needed (handle both new and conflict cases)
+        if conflict_exists or index_name not in existing_indexes:
             try:
                 await collection.create_indexes([index])
                 print(f"✅ Created index: {index_name}")
             except Exception as e:
                 print(f"⚠️ Failed to create index {index_name}: {str(e)}")
-
 # ======================
 # INTERACTIVE UI
 # ======================
