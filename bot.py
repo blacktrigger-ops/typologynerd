@@ -2,7 +2,7 @@ import os
 import asyncio
 from datetime import datetime
 from typing import List, Optional
-
+from pydantic import Field
 import discord
 from discord import ui
 from discord.ext import commands
