@@ -10,7 +10,7 @@ from pymongo import IndexModel, TEXT
 from beanie import Document, init_beanie
 from pydantic import Field
 from dotenv import load_dotenv
-
+from datetime import datetime, timezone
 load_dotenv()
 
 # ======================
@@ -25,8 +25,8 @@ class TypologyDefinition(Document):
     reference: str = Field(default="")
     votes: int = Field(default=0)
     voters: List[int] = Field(default_factory=list)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    last_updated: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda:datetime.now(timezone.utc))
+    last_updated: datetime = Field(default_factory=lambda:datetime.now(timezone.utc))
     
     class Settings:
         name = "typology_definitions"
@@ -116,7 +116,7 @@ class DefinitionView(ui.View):
         embed = discord.Embed(
             title=f"📖 {self.definitions[0].term} Definitions (Page {self.page + 1})",
             color=0x6A0DAD,
-            timestamp=datetime.utcnow()
+            timestamp=datetime.now(timezone.utc)
         )
         
         for idx, defn in enumerate(page_defs, 1):
@@ -165,7 +165,7 @@ class DefinitionView(ui.View):
             
         definition.voters.append(interaction.user.id)
         definition.votes += 1
-        definition.last_updated = datetime.utcnow()
+        definition.last_updated = datetime.now(timezone.utc)
         await definition.save()
         
         await interaction.response.send_message("✅ Vote recorded!", ephemeral=True)
@@ -188,8 +188,10 @@ class DefinitionView(ui.View):
     @ui.button(emoji="🗑️", style=discord.ButtonStyle.red)
     async def delete_btn(self, interaction: discord.Interaction, button: ui.Button):
         definition = self.definitions[self.page * self.per_page]
-        
-        if interaction.user.id != definition.author_id:
+        MOD_ROLE_ID=1390273308523499530
+        is_author=interaction.user.id==definition.author_id
+is_mod=any(role.id == MOD_ROLE_ID for role in interaction.user.roles)
+        if not(is_author or is_mod):
             await interaction.response.send_message(
                 "❌ You can only delete your own definitions", 
                 ephemeral=True
@@ -226,7 +228,7 @@ class EditModal(ui.Modal, title="Edit Definition"):
     
     async def on_submit(self, interaction: discord.Interaction):
         self.definition.text = str(self.new_text)
-        self.definition.last_updated = datetime.utcnow()
+        self.definition.last_updated = datetime.now(timezone.utc)
         await self.definition.save()
         await interaction.response.send_message("✅ Definition updated!", ephemeral=True)
 
