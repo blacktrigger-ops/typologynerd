@@ -1,5 +1,6 @@
 import os
 import asyncio
+import re
 from datetime import datetime, timezone
 from typing import List, Optional, Dict
 import discord
@@ -34,7 +35,7 @@ class TypologyEntry(Document):
         name = "typology_entries"
 
 # ======================
-# DISTINCT VALUE HELPERS
+# DISTINCT VALUE HELPERS (CASE-INSENSITIVE)
 # ======================
 async def get_distinct_categories() -> List[str]:
     client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
@@ -46,6 +47,7 @@ async def get_distinct_topics(category: str) -> List[str]:
     client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
     db = client[os.getenv("MONGO_DB", "typology_bot")]
     collection = db["typology_entries"]
+    # Use exact match for better performance
     return await collection.distinct("topic", {"category": category})
 
 async def get_distinct_titles() -> List[str]:
@@ -73,7 +75,7 @@ async def initialize_database():
         if await new_collection.count_documents({}) == 0:
             print("🚚 Migrating old definitions to new format...")
             async for doc in old_collection.find():
-                # Map old fields to new structure
+                # Map old fields to new structure with image preservation
                 new_doc = {
                     "title": doc["term"],
                     "category": "General",
@@ -83,7 +85,7 @@ async def initialize_database():
                     "author_name": doc["author_name"],
                     "created_at": doc["created_at"],
                     "last_updated": doc["last_updated"],
-                    "image_url": "",
+                    "image_url": doc.get("image_url", ""),  # Preserve image if exists
                     "reference": doc.get("reference", ""),
                     "votes": doc.get("votes", 0),
                     "voters": doc.get("voters", []),
@@ -94,61 +96,12 @@ async def initialize_database():
             # Rename instead of delete to keep backup
             await old_collection.rename("typology_definitions_backup")
     
-    # Manual index management
+    # Create indexes
     collection = db["typology_entries"]
-    existing_indexes = await collection.index_information()
-    
-    # Define our desired indexes
-    desired_indexes = [
-        ("title_idx", [("title", 1)]),
-        ("category_idx", [("category", 1)]),
-        ("topic_idx", [("topic", 1)]),
-        ("popularity_idx", [("votes", -1)]),
-        ("author_idx", [("author_id", 1)]),
-        ("search_idx", [("title", TEXT), ("description", TEXT)])
-    ]
-    
-    for index_name, index_keys in desired_indexes:
-        # Check for existing index with same keys but different name
-        conflict_exists = False
-        for existing_name, existing_info in existing_indexes.items():
-            if existing_name == "_id_":
-                continue
-                
-            # Normalize index representations
-            existing_keys = [(k, v) for k, v in existing_info["key"]]
-            normalized_existing = []
-            for key, spec in existing_keys:
-                if spec == "text":
-                    normalized_existing.append((key, TEXT))
-                else:
-                    normalized_existing.append((key, int(spec)))
-            
-            # Compare key sets
-            if set(normalized_existing) == set(index_keys) and existing_name != index_name:
-                conflict_exists = True
-                try:
-                    await collection.drop_index(existing_name)
-                    print(f"♻️ Dropped conflicting index: {existing_name}")
-                    break
-                except Exception as e:
-                    print(f"⚠️ Failed to drop index {existing_name}: {str(e)}")
-        
-        # Create index if needed
-        if conflict_exists or index_name not in existing_indexes:
-            try:
-                # Special handling for text index
-                if any(spec == TEXT for _, spec in index_keys):
-                    # Create text index with proper specification
-                    await collection.create_index(
-                        [(field, TEXT) for field, spec in index_keys],
-                        name=index_name
-                    )
-                else:
-                    await collection.create_index(index_keys, name=index_name)
-                print(f"✅ Created index: {index_name}")
-            except Exception as e:
-                print(f"⚠️ Failed to create index {index_name}: {str(e)}")
+    await collection.create_index([("title", "text")], name="title_text_idx", default_language="english")
+    await collection.create_index([("category", 1)], name="category_idx")
+    await collection.create_index([("topic", 1)], name="topic_idx")
+    await collection.create_index([("votes", -1)], name="popularity_idx")
 
 # ======================
 # HIERARCHICAL UI COMPONENTS
@@ -158,16 +111,11 @@ class CategorySelect(ui.View):
         super().__init__(timeout=60.0)
         self.category = None
         self.categories = categories
-        
-        # Add select menu
         self.add_item(CategoryDropdown(categories))
 
 class CategoryDropdown(ui.Select):
     def __init__(self, categories: List[str]):
-        options = [
-            SelectOption(label=cat, value=cat, emoji="📂")
-            for cat in categories
-        ]
+        options = [SelectOption(label=cat, value=cat, emoji="📂") for cat in categories]
         options.append(SelectOption(label="+ Create New Category", value="__new__", emoji="➕"))
         super().__init__(placeholder="Select a category...", options=options)
         
@@ -181,16 +129,11 @@ class TopicSelect(ui.View):
         super().__init__(timeout=60.0)
         self.topic = None
         self.topics = topics
-        
-        # Add select menu
         self.add_item(TopicDropdown(topics))
 
 class TopicDropdown(ui.Select):
     def __init__(self, topics: List[str]):
-        options = [
-            SelectOption(label=topic, value=topic, emoji="📝")
-            for topic in topics
-        ]
+        options = [SelectOption(label=topic, value=topic, emoji="📝") for topic in topics]
         options.append(SelectOption(label="+ Create New Topic", value="__new__", emoji="➕"))
         super().__init__(placeholder="Select a topic...", options=options)
         
@@ -218,7 +161,6 @@ class EntryView(ui.View):
             
         entry = self.entries[self.page]
         
-        # Fetch author
         try:
             author = await bot.fetch_user(entry.author_id)
         except:
@@ -231,37 +173,21 @@ class EntryView(ui.View):
             timestamp=datetime.now(timezone.utc)
         )
         
-        # Add hierarchy information
-        embed.add_field(
-            name="Category",
-            value=f"```\n{entry.category}\n```",
-            inline=False
-        )
-        embed.add_field(
-            name="Topic",
-            value=f"```\n{entry.topic}\n```",
-            inline=False
-        )
+        embed.add_field(name="Category", value=f"```\n{entry.category}\n```", inline=False)
+        embed.add_field(name="Topic", value=f"```\n{entry.topic}\n```", inline=False)
         
-        # Add author info
         if author:
             embed.set_author(name=author.display_name, icon_url=author.display_avatar.url)
         else:
             embed.set_author(name="Unknown Author")
         
-        # Add reference if exists
         if entry.reference:
-            embed.add_field(
-                name="Reference",
-                value=f"```\n{entry.reference}\n```",
-                inline=False
-            )
+            embed.add_field(name="Reference", value=f"```\n{entry.reference}\n```", inline=False)
             
-        # Add image if available
+        # Display image directly in embed
         if entry.image_url:
             embed.set_image(url=entry.image_url)
             
-        # Footer with metadata
         footer_text = [
             f"⭐ Votes: {entry.votes}",
             f"🆔 ID: {entry.id}",
@@ -298,7 +224,6 @@ class EntryView(ui.View):
         entry.votes += 1
         entry.last_updated = datetime.now(timezone.utc)
         await entry.save()
-        
         await interaction.response.send_message("✅ Vote recorded!", ephemeral=True)
         await self.update_embed()
 
@@ -307,10 +232,7 @@ class EntryView(ui.View):
         entry = self.entries[self.page]
         
         if interaction.user.id != entry.author_id:
-            await interaction.response.send_message(
-                "❌ You can only edit your own entries", 
-                ephemeral=True
-            )
+            await interaction.response.send_message("❌ You can only edit your own entries", ephemeral=True)
             return
             
         modal = EditModal(entry)
@@ -321,32 +243,24 @@ class EntryView(ui.View):
         entry = self.entries[self.page]
         
         if interaction.user.id != entry.author_id:
-            await interaction.response.send_message(
-                "❌ You can only move your own entries", 
-                ephemeral=True
-            )
+            await interaction.response.send_message("❌ You can only move your own entries", ephemeral=True)
             return
             
-        # Start move process
         await self.start_move_process(interaction, entry)
         
     async def start_move_process(self, interaction: discord.Interaction, entry: TypologyEntry):
-        # Step 1: Category Selection
         categories = await get_distinct_categories()
         category_view = CategorySelect(categories)
         category_msg = await interaction.followup.send(
             f"**📂 Select a new category for '{entry.title}'**",
             view=category_view,
-            ephemeral=True
-        )
+            ephemeral=True)
         
-        # Wait for category selection
         await category_view.wait()
         if not category_view.category:
             await category_msg.edit(content="⏱️ Category selection timed out", view=None)
             return
             
-        # Handle new category creation
         if category_view.category == "__new__":
             await category_msg.edit(content="⌛ Waiting for new category...", view=None)
             
@@ -364,19 +278,15 @@ class EntryView(ui.View):
         else:
             category = category_view.category
         
-        # Step 2: Topic Selection
         topics = await get_distinct_topics(category)
-        
         topic_view = TopicSelect(topics)
         await category_msg.edit(content=f"**📝 Select a topic in '{category}'**", view=topic_view)
         
-        # Wait for topic selection
         await topic_view.wait()
         if not topic_view.topic:
             await category_msg.edit(content="⏱️ Topic selection timed out", view=None)
             return
             
-        # Handle new topic creation
         if topic_view.topic == "__new__":
             await category_msg.edit(content="⌛ Waiting for new topic...", view=None)
             
@@ -391,17 +301,12 @@ class EntryView(ui.View):
         else:
             topic = topic_view.topic
         
-        # Update entry
         entry.category = category
         entry.topic = topic
         entry.last_updated = datetime.now(timezone.utc)
         await entry.save()
         
-        # Update view
-        await interaction.followup.send(
-            f"✅ Entry moved to **{category} → {topic}**",
-            ephemeral=True
-        )
+        await interaction.followup.send(f"✅ Entry moved to **{category} → {topic}**", ephemeral=True)
         await self.update_embed()
         await category_msg.delete()
 
@@ -414,21 +319,14 @@ class EntryView(ui.View):
         is_mod = MOD_ROLE_ID and any(role.id == MOD_ROLE_ID for role in interaction.user.roles)
         
         if not (is_author or is_mod):
-            await interaction.response.send_message(
-                "❌ You can only delete your own entries", 
-                ephemeral=True
-            )
+            await interaction.response.send_message("❌ You can only delete your own entries", ephemeral=True)
             return
             
         await entry.delete()
         self.entries.pop(self.page)
         
         if not self.entries:
-            await interaction.response.edit_message(
-                content=f"✅ Entry deleted",
-                embed=None,
-                view=None
-            )
+            await interaction.response.edit_message(content=f"✅ Entry deleted", embed=None, view=None)
             return
             
         if self.page >= len(self.entries):
@@ -464,7 +362,18 @@ class EditModal(ui.Modal, title="Edit Entry Content"):
         self.entry.reference = str(self.new_reference)
         self.entry.last_updated = datetime.now(timezone.utc)
         await self.entry.save()
-        await interaction.response.send_message("✅ Content updated!", ephemeral=True)
+        
+        # Show image preview if URL was changed
+        if self.entry.image_url:
+            preview_embed = discord.Embed(title="Image Preview", color=0x3498DB)
+            preview_embed.set_image(url=self.entry.image_url)
+            await interaction.response.send_message(
+                "✅ Content updated! Here's your image preview:",
+                embed=preview_embed,
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message("✅ Content updated!", ephemeral=True)
 
 # ======================
 # BOT SETUP
@@ -491,30 +400,43 @@ async def on_ready():
             await asyncio.sleep(2 ** attempt)
 
 # ======================
-# DEFINITION CREATION FLOW
+# DEFINITION CREATION FLOW (CASE-INSENSITIVE & MULTI-WORD)
 # ======================
-async def create_definition_flow(message: discord.Message, title: str):
+async def create_definition_flow(message: discord.Message):
     try:
+        # Extract multi-word title (case-insensitive)
+        title = re.sub(r'^tp define\s*', '', message.content, flags=re.IGNORECASE).strip()
+        if not title:
+            await message.channel.send("❌ Please provide a title after `tp define`")
+            return
+            
+        # Check for existing title (case-insensitive)
+        existing = await TypologyEntry.find_one({
+            "title": {"$regex": f"^{re.escape(title)}$", "$options": "i"}
+        })
+        
+        if existing:
+            await message.channel.send(f"⚠️ An entry with title '{title}' already exists")
+            return
+        
         # Step 1: Category Selection
         categories = await get_distinct_categories()
         category_view = CategorySelect(categories)
         category_msg = await message.channel.send(f"**📂 Select a category for '{title}'**", view=category_view)
         
-        # Wait for category selection
         await category_view.wait()
         if not category_view.category:
             await category_msg.edit(content="⏱️ Category selection timed out", view=None)
             return
             
-        # Handle new category creation
         if category_view.category == "__new__":
             await category_msg.edit(content="⌛ Waiting for new category...", view=None)
-            await message.channel.send("Please enter a name for the new category:", view=None)
             
             def check(m):
                 return m.author == message.author and m.channel == message.channel
                 
             try:
+                await message.channel.send("Please enter a name for the new category:")
                 response = await bot.wait_for('message', timeout=60.0, check=check)
                 category = response.content.strip()
                 await response.delete()
@@ -526,22 +448,19 @@ async def create_definition_flow(message: discord.Message, title: str):
         
         # Step 2: Topic Selection
         topics = await get_distinct_topics(category)
-        
         topic_view = TopicSelect(topics)
         await category_msg.edit(content=f"**📝 Select a topic in '{category}'**", view=topic_view)
         
-        # Wait for topic selection
         await topic_view.wait()
         if not topic_view.topic:
             await category_msg.edit(content="⏱️ Topic selection timed out", view=None)
             return
             
-        # Handle new topic creation
         if topic_view.topic == "__new__":
             await category_msg.edit(content="⌛ Waiting for new topic...", view=None)
-            await message.channel.send("Please enter a name for the new topic:", view=None)
             
             try:
+                await message.channel.send("Please enter a name for the new topic:")
                 response = await bot.wait_for('message', timeout=60.0, check=check)
                 topic = response.content.strip()
                 await response.delete()
@@ -592,24 +511,15 @@ async def create_definition_flow(message: discord.Message, title: str):
         await message.channel.send(f"❌ Error in creation flow: {str(e)}")
 
 # ======================
-# MESSAGE HANDLING
+# MESSAGE HANDLING (CASE-INSENSITIVE)
 # ======================
 @bot.event
 async def on_message(message):
     await bot.process_commands(message)
     
-    if message.content.lower().startswith("tp define") and not message.author.bot:
-        try:
-            parts = message.content.split(maxsplit=2)
-            if len(parts) < 2:
-                await message.channel.send("❌ Format: `tp define TITLE`")
-                return
-                
-            title = parts[1].strip()
-            await create_definition_flow(message, title)
-            
-        except Exception as e:
-            await message.channel.send(f"❌ Error: {str(e)}")
+    # Case-insensitive command matching
+    if re.match(r'^tp define\b', message.content, re.IGNORECASE) and not message.author.bot:
+        await create_definition_flow(message)
 
 # ======================
 # COMMANDS
@@ -671,10 +581,10 @@ async def define(ctx, *, title: str = None):
             await msg.delete()
             
         else:
-            # Direct title search
-            entries = await TypologyEntry.find(
-                TypologyEntry.title == title
-            ).sort(-TypologyEntry.votes).to_list()
+            # Direct title search (case-insensitive)
+            entries = await TypologyEntry.find({
+                "title": {"$regex": f"^{re.escape(title)}$", "$options": "i"}
+            }).sort(-TypologyEntry.votes).to_list()
             
             if not entries:
                 await ctx.send(f"❌ No entries found for '{title}'")
