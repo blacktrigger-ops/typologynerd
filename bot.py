@@ -190,7 +190,7 @@ class DefinitionView(ui.View):
         definition = self.definitions[self.page * self.per_page]
         MOD_ROLE_ID=1390273308523499530
         is_author=interaction.user.id==definition.author_id
-is_mod=any(role.id == MOD_ROLE_ID for role in interaction.user.roles)
+        is_mod=any(role.id == MOD_ROLE_ID for role in interaction.user.roles)
         if not(is_author or is_mod):
             await interaction.response.send_message(
                 "❌ You can only delete your own definitions", 
