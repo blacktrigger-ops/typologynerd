@@ -1,6 +1,6 @@
 import os
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone  # Updated for timezone
 from typing import List, Optional
 import discord
 from discord import ui
@@ -10,7 +10,7 @@ from pymongo import IndexModel, TEXT
 from beanie import Document, init_beanie
 from pydantic import Field
 from dotenv import load_dotenv
-from datetime import datetime, timezone
+
 load_dotenv()
 
 # ======================
@@ -25,21 +25,21 @@ class TypologyDefinition(Document):
     reference: str = Field(default="")
     votes: int = Field(default=0)
     voters: List[int] = Field(default_factory=list)
-    created_at: datetime = Field(default_factory=lambda:datetime.now(timezone.utc))
-    last_updated: datetime = Field(default_factory=lambda:datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))  # Fixed
+    last_updated: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))  # Fixed
     
     class Settings:
         name = "typology_definitions"
         # Removed indexes to prevent auto-creation
 
 # ======================
-# DATABASE INITIALIZATION (FIXED)
+# DATABASE INITIALIZATION
 # ======================
 async def initialize_database():
     client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
     db = client[os.getenv("MONGO_DB", "typology_bot")]
     
-    # Initialize Beanie without special parameters
+    # Initialize Beanie without any parameters
     await init_beanie(database=db, document_models=[TypologyDefinition])
     
     # Manual index management
@@ -98,7 +98,7 @@ async def initialize_database():
                 print(f"⚠️ Failed to create index {index_name}: {str(e)}")
 
 # ======================
-# INTERACTIVE UI
+# INTERACTIVE UI (UPDATED)
 # ======================
 class DefinitionView(ui.View):
     def __init__(self, definitions: List[TypologyDefinition], user_id: int):
@@ -106,31 +106,53 @@ class DefinitionView(ui.View):
         self.definitions = definitions
         self.user_id = user_id
         self.page = 0
-        self.per_page = 5
         self.message = None
 
     async def update_embed(self, interaction: Optional[discord.Interaction] = None):
-        start = self.page * self.per_page
-        page_defs = self.definitions[start:start+self.per_page]
+        if not self.definitions:
+            if self.message:
+                await self.message.edit(content="❌ No definitions found", embed=None, view=None)
+            return
+            
+        definition = self.definitions[self.page]
         
         embed = discord.Embed(
-            title=f"📖 {self.definitions[0].term} Definitions (Page {self.page + 1})",
+            title=f"📖 {definition.term} Definition (⭐ {definition.votes})",
             color=0x6A0DAD,
-            timestamp=datetime.now(timezone.utc)
+            timestamp=datetime.now(timezone.utc)  # Fixed
         )
         
-        for idx, defn in enumerate(page_defs, 1):
-            embed.add_field(
-                name=f"#{start + idx} (⭐ {defn.votes})",
-                value=(
-                    f"{defn.text}\n\n"
-                    f"↳ By {defn.author_name}\n"
-                    f"↳ Categorized by {await self.fetch_username(defn.categorizer_id)}\n"
-                    f"↳ Reference: {defn.reference or 'None'}\n"
-                    f"↳ Updated {discord.utils.format_dt(defn.last_updated, style='R')}"
-                ),
-                inline=False
-            )
+        embed.add_field(
+            name="Content",
+            value=definition.text,
+            inline=False
+        )
+        embed.add_field(
+            name="Author",
+            value=definition.author_name,
+            inline=True
+        )
+        embed.add_field(
+            name="Categorized by",
+            value=await self.fetch_username(definition.categorizer_id),
+            inline=True
+        )
+        embed.add_field(
+            name="Reference",
+            value=definition.reference or "None",
+            inline=True
+        )
+        embed.add_field(
+            name="Created",
+            value=discord.utils.format_dt(definition.created_at, style='R'),
+            inline=True
+        )
+        embed.add_field(
+            name="Last Updated",
+            value=discord.utils.format_dt(definition.last_updated, style='R'),
+            inline=True
+        )
+        embed.set_footer(text=f"Page {self.page + 1}/{len(self.definitions)} • ID: {definition.id}")
         
         if interaction:
             await interaction.response.edit_message(embed=embed, view=self)
@@ -151,13 +173,13 @@ class DefinitionView(ui.View):
 
     @ui.button(emoji="➡️", style=discord.ButtonStyle.blurple)
     async def next_page(self, interaction: discord.Interaction, button: ui.Button):
-        if (self.page + 1) * self.per_page < len(self.definitions):
+        if self.page < len(self.definitions) - 1:
             self.page += 1
             await self.update_embed(interaction)
 
     @ui.button(emoji="⭐", style=discord.ButtonStyle.green)
     async def upvote(self, interaction: discord.Interaction, button: ui.Button):
-        definition = self.definitions[self.page * self.per_page]
+        definition = self.definitions[self.page]
         
         if interaction.user.id in definition.voters:
             await interaction.response.send_message("❌ You've already voted!", ephemeral=True)
@@ -165,7 +187,7 @@ class DefinitionView(ui.View):
             
         definition.voters.append(interaction.user.id)
         definition.votes += 1
-        definition.last_updated = datetime.now(timezone.utc)
+        definition.last_updated = datetime.now(timezone.utc)  # Fixed
         await definition.save()
         
         await interaction.response.send_message("✅ Vote recorded!", ephemeral=True)
@@ -173,7 +195,7 @@ class DefinitionView(ui.View):
 
     @ui.button(emoji="✏️", style=discord.ButtonStyle.gray)
     async def edit_btn(self, interaction: discord.Interaction, button: ui.Button):
-        definition = self.definitions[self.page * self.per_page]
+        definition = self.definitions[self.page]
         
         if interaction.user.id != definition.author_id:
             await interaction.response.send_message(
@@ -187,11 +209,16 @@ class DefinitionView(ui.View):
 
     @ui.button(emoji="🗑️", style=discord.ButtonStyle.red)
     async def delete_btn(self, interaction: discord.Interaction, button: ui.Button):
-        definition = self.definitions[self.page * self.per_page]
-        MOD_ROLE_ID=1390273308523499530
-        is_author=interaction.user.id==definition.author_id
-        is_mod=any(role.id == MOD_ROLE_ID for role in interaction.user.roles)
-        if not(is_author or is_mod):
+        definition = self.definitions[self.page]
+        
+        # MOD_ROLE_ID = 1234567890  # Replace with your actual role ID
+        MOD_ROLE_ID = int(os.getenv("MOD_ROLE_ID", 0))  # Get from environment
+        
+        # Check permissions: author OR mod role
+        is_author = interaction.user.id == definition.author_id
+        is_mod = MOD_ROLE_ID and any(role.id == MOD_ROLE_ID for role in interaction.user.roles)
+        
+        if not (is_author or is_mod):
             await interaction.response.send_message(
                 "❌ You can only delete your own definitions", 
                 ephemeral=True
@@ -199,7 +226,7 @@ class DefinitionView(ui.View):
             return
             
         await definition.delete()
-        self.definitions.pop(self.page * self.per_page)
+        self.definitions.pop(self.page)
         
         if not self.definitions:
             await interaction.response.edit_message(
@@ -208,6 +235,10 @@ class DefinitionView(ui.View):
                 view=None
             )
             return
+            
+        # Adjust page index if needed
+        if self.page >= len(self.definitions):
+            self.page = max(0, len(self.definitions) - 1)
             
         await interaction.response.send_message("✅ Definition deleted", ephemeral=True)
         await self.update_embed()
@@ -228,7 +259,7 @@ class EditModal(ui.Modal, title="Edit Definition"):
     
     async def on_submit(self, interaction: discord.Interaction):
         self.definition.text = str(self.new_text)
-        self.definition.last_updated = datetime.now(timezone.utc)
+        self.definition.last_updated = datetime.now(timezone.utc)  # Fixed
         await self.definition.save()
         await interaction.response.send_message("✅ Definition updated!", ephemeral=True)
 
@@ -324,12 +355,13 @@ async def on_message(message):
             await message.channel.send(f"❌ Error: {str(e)}")
 
 # ======================
-# COMMANDS
+# COMMANDS (UPDATED)
 # ======================
 @bot.command()
 async def define(ctx, term: str):
-    """View definitions with interactive controls"""
+    """View definitions with interactive controls (one per page)"""
     try:
+        # Get definitions sorted by votes (highest first)
         definitions = await TypologyDefinition.find(
             TypologyDefinition.term == term.upper()
         ).sort(-TypologyDefinition.votes).to_list()
@@ -352,24 +384,27 @@ async def define(ctx, term: str):
 
 @bot.command()
 async def search(ctx, *, query: str):
-    """Search across all definitions"""
+    """Search across all definitions (one per page)"""
     try:
+        # Get search results sorted by votes (highest first)
         results = await TypologyDefinition.find(
             {"$text": {"$search": query}}
-        ).sort(-TypologyDefinition.votes).limit(5).to_list()
+        ).sort(-TypologyDefinition.votes).to_list()
         
         if not results:
             await ctx.send("🔍 No results found")
             return
             
-        embed = discord.Embed(title="🔍 Search Results", color=0x3498DB)
-        for result in results:
-            embed.add_field(
-                name=f"{result.term} (⭐ {result.votes})",
-                value=f"{result.text[:150]}...",
-                inline=False
-            )
-        await ctx.send(embed=embed)
+        # Create view with search results
+        view = DefinitionView(results, ctx.author.id)
+        view.message = await ctx.send(
+            embed=discord.Embed(
+                title=f"Search results for: {query}",
+                color=0x3498DB
+            ),
+            view=view
+        )
+        await view.update_embed()
     except Exception as e:
         await ctx.send(f"❌ Search error: {str(e)}")
 
@@ -381,6 +416,10 @@ if __name__ == "__main__":
     if missing := [var for var in required_vars if not os.getenv(var)]:
         print(f"❌ Missing environment variables: {', '.join(missing)}")
         exit(1)
+    
+    # Optional: Warn if MOD_ROLE_ID is missing
+    if not os.getenv("MOD_ROLE_ID"):
+        print("⚠️ MOD_ROLE_ID not set - moderator deletion disabled")
     
     try:
         bot.run(os.getenv("DISCORD_TOKEN"))
