@@ -166,6 +166,7 @@ class EntryView(ui.View):
             description=entry.description,
             color=0x6A0DAD,
             timestamp=datetime.now(timezone.utc)
+        )
         
         embed.add_field(name="Category", value=f"```\n{entry.category}\n```", inline=False)
         embed.add_field(name="Topic", value=f"```\n{entry.topic}\n```", inline=False)
@@ -232,15 +233,16 @@ class EntryView(ui.View):
                 return
                 
             await interaction.response.defer(ephemeral=True)
-            await self._handle_move_process(interaction, entry)
+            await self._execute_move_process(interaction, entry)
             
         except Exception as e:
-            print(f"Move error: {e}")
+            print(f"Move button error: {e}")
             await interaction.followup.send("❌ Failed to start move process", ephemeral=True)
 
-    async def _handle_move_process(self, interaction: discord.Interaction, entry: TypologyEntry):
+    async def _execute_move_process(self, interaction: discord.Interaction, entry: TypologyEntry):
+        """Complete move process with proper error handling"""
         try:
-            # Category selection
+            # Step 1: Category Selection
             categories = await get_distinct_categories()
             if not categories:
                 await interaction.followup.send("❌ No categories available", ephemeral=True)
@@ -248,7 +250,7 @@ class EntryView(ui.View):
 
             category_view = CategorySelect(categories)
             category_msg = await interaction.followup.send(
-                f"**📂 Select category for '{entry.title}'**",
+                f"**📂 Select new category for '{entry.title}'**",
                 view=category_view,
                 ephemeral=True
             )
@@ -260,12 +262,13 @@ class EntryView(ui.View):
                 
             if category_view.category == "__new__":
                 await category_msg.edit(content="⌛ Enter new category...", view=None)
-                category = await self._get_user_input(interaction, "Enter category name:")
-                if not category: return
+                category = await self._get_text_input(interaction, "Enter category name:")
+                if not category:
+                    return
             else:
                 category = category_view.category
 
-            # Topic selection
+            # Step 2: Topic Selection
             topics = await get_distinct_topics(category)
             topic_view = TopicSelect(topics)
             await category_msg.edit(
@@ -280,8 +283,9 @@ class EntryView(ui.View):
                 
             if topic_view.topic == "__new__":
                 await category_msg.edit(content="⌛ Enter new topic...", view=None)
-                topic = await self._get_user_input(interaction, "Enter topic name:")
-                if not topic: return
+                topic = await self._get_text_input(interaction, "Enter topic name:")
+                if not topic:
+                    return
             else:
                 topic = topic_view.topic
 
@@ -303,14 +307,23 @@ class EntryView(ui.View):
             print(f"Move process error: {e}")
             await interaction.followup.send("❌ Move failed", ephemeral=True)
 
-    async def _get_user_input(self, interaction: discord.Interaction, prompt: str) -> Optional[str]:
+    async def _get_text_input(self, interaction: discord.Interaction, prompt: str) -> Optional[str]:
+        """Helper to get text input from user"""
         try:
             await interaction.followup.send(prompt, ephemeral=True)
             
             def check(m):
-                return m.author == interaction.user and m.channel == interaction.channel
+                return (
+                    m.author == interaction.user 
+                    and m.channel == interaction.channel
+                    and not m.author.bot
+                )
                 
-            response = await bot.wait_for('message', timeout=60.0, check=check)
+            response = await bot.wait_for(
+                'message',
+                timeout=60.0,
+                check=check
+            )
             content = response.content.strip()
             await response.delete()
             return content
