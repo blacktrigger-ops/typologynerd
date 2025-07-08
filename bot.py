@@ -6,11 +6,11 @@ import discord
 from discord import ui
 from discord.ext import commands
 from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo import IndexModel
+from pymongo import IndexModel, TEXT
 from beanie import Document, init_beanie
 from pydantic import Field
 from dotenv import load_dotenv
-from pymongo import TEXT
+
 load_dotenv()
 
 # ======================
@@ -30,53 +30,49 @@ class TypologyDefinition(Document):
     
     class Settings:
         name = "typology_definitions"
-        indexes = [
-            IndexModel([("term", "text")], name="term_text_idx"),
-            IndexModel([("term", -1), ("votes", -1)], name="popularity_idx"),
-            IndexModel([("author_id", 1)], name="author_idx"),
-            IndexModel([("categorizer_id", 1)], name="categorizer_idx"),
-IndexModel([("term", TEXT), ("text", TEXT)], name="term_text_search")
-        ]
+        # Removed indexes to prevent auto-creation
 
 # ======================
-# DATABASE INITIALIZATION
+# DATABASE INITIALIZATION (FIXED)
 # ======================
-
 async def initialize_database():
     client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
     db = client[os.getenv("MONGO_DB", "typology_bot")]
     
-    # Initialize Beanie without auto-indexing
-    await init_beanie(
-        database=db,
-        document_models=[TypologyDefinition],
-        allow_index_dropping=False,
-        create_indexes=False  # CRITICAL FIX: Disable auto-index creation
-    )
+    # Initialize Beanie without special parameters
+    await init_beanie(database=db, document_models=[TypologyDefinition])
     
-    # Manual index management to prevent conflicts
+    # Manual index management
     collection = db["typology_definitions"]
     existing_indexes = await collection.index_information()
     
-    for index in TypologyDefinition.Settings.indexes:
-        index_name = index.document["name"]
-        index_keys = tuple(index.document["key"])
-        
+    # Define our desired indexes
+    desired_indexes = [
+        ("term_text_idx", [("term", 1), ("text", 1)]),
+        ("popularity_idx", [("term", -1), ("votes", -1)]),
+        ("author_idx", [("author_id", 1)]),
+        ("categorizer_idx", [("categorizer_id", 1)]),
+        ("term_text_search", [("term", TEXT), ("text", TEXT)])
+    ]
+    
+    for index_name, index_keys in desired_indexes:
         # Check for existing index with same keys but different name
         conflict_exists = False
         for existing_name, existing_info in existing_indexes.items():
             if existing_name == "_id_":
                 continue
                 
-            # Handle both list and tuple representations
-            existing_keys = tuple(existing_info["key"])
-            if isinstance(existing_keys[0], tuple):
-                existing_keys = tuple((k, v) for k, v in existing_keys)
-            else:
-                existing_keys = tuple(existing_keys)
-                
-            # Compare normalized key sets
-            if set(existing_keys) == set(index_keys) and existing_name != index_name:
+            # Normalize index representations
+            existing_keys = [(k, v) for k, v in existing_info["key"]]
+            normalized_existing = []
+            for key, spec in existing_keys:
+                if spec == "text":
+                    normalized_existing.append((key, TEXT))
+                else:
+                    normalized_existing.append((key, int(spec)))
+            
+            # Compare key sets
+            if set(normalized_existing) == set(index_keys) and existing_name != index_name:
                 conflict_exists = True
                 try:
                     await collection.drop_index(existing_name)
@@ -85,13 +81,22 @@ async def initialize_database():
                 except Exception as e:
                     print(f"⚠️ Failed to drop index {existing_name}: {str(e)}")
         
-        # Create index if needed (handle both new and conflict cases)
+        # Create index if needed
         if conflict_exists or index_name not in existing_indexes:
             try:
-                await collection.create_indexes([index])
+                # Special handling for text index
+                if any(spec == TEXT for _, spec in index_keys):
+                    # Create text index with proper specification
+                    await collection.create_index(
+                        [(field, TEXT) for field, spec in index_keys],
+                        name=index_name
+                    )
+                else:
+                    await collection.create_index(index_keys, name=index_name)
                 print(f"✅ Created index: {index_name}")
             except Exception as e:
                 print(f"⚠️ Failed to create index {index_name}: {str(e)}")
+
 # ======================
 # INTERACTIVE UI
 # ======================
@@ -238,13 +243,13 @@ async def on_ready():
     max_retries = 3
     for attempt in range(1, max_retries + 1):
         try:
-            print(f"🔄 Database initialization attempt {attempt}/3")
+            print(f"🔄 Database initialization attempt {attempt}/{max_retries}")
             await initialize_database()
             print(f"✅ Bot ready as {bot.user}")
             break
         except Exception as e:
             print(f"❌ Attempt {attempt} failed: {str(e)}")
-            if attempt == 3:
+            if attempt == max_retries:
                 print("💥 Failed to initialize database after 3 attempts")
                 raise
             await asyncio.sleep(2 ** attempt)
