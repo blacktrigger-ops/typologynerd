@@ -34,6 +34,27 @@ class TypologyEntry(Document):
         name = "typology_entries"
 
 # ======================
+# DISTINCT VALUE HELPERS
+# ======================
+async def get_distinct_categories() -> List[str]:
+    client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
+    db = client[os.getenv("MONGO_DB", "typology_bot")]
+    collection = db["typology_entries"]
+    return await collection.distinct("category")
+
+async def get_distinct_topics(category: str) -> List[str]:
+    client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
+    db = client[os.getenv("MONGO_DB", "typology_bot")]
+    collection = db["typology_entries"]
+    return await collection.distinct("topic", {"category": category})
+
+async def get_distinct_titles() -> List[str]:
+    client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
+    db = client[os.getenv("MONGO_DB", "typology_bot")]
+    collection = db["typology_entries"]
+    return await collection.distinct("title")
+
+# ======================
 # DATABASE INITIALIZATION WITH MIGRATION
 # ======================
 async def initialize_database():
@@ -311,7 +332,7 @@ class EntryView(ui.View):
         
     async def start_move_process(self, interaction: discord.Interaction, entry: TypologyEntry):
         # Step 1: Category Selection
-        categories = await TypologyEntry.distinct("category")
+        categories = await get_distinct_categories()
         category_view = CategorySelect(categories)
         category_msg = await interaction.followup.send(
             f"**📂 Select a new category for '{entry.title}'**",
@@ -344,9 +365,7 @@ class EntryView(ui.View):
             category = category_view.category
         
         # Step 2: Topic Selection
-        topics = await TypologyEntry.find(
-            TypologyEntry.category == category
-        ).distinct("topic")
+        topics = await get_distinct_topics(category)
         
         topic_view = TopicSelect(topics)
         await category_msg.edit(content=f"**📝 Select a topic in '{category}'**", view=topic_view)
@@ -477,7 +496,7 @@ async def on_ready():
 async def create_definition_flow(message: discord.Message, title: str):
     try:
         # Step 1: Category Selection
-        categories = await TypologyEntry.distinct("category")
+        categories = await get_distinct_categories()
         category_view = CategorySelect(categories)
         category_msg = await message.channel.send(f"**📂 Select a category for '{title}'**", view=category_view)
         
@@ -489,7 +508,6 @@ async def create_definition_flow(message: discord.Message, title: str):
             
         # Handle new category creation
         if category_view.category == "__new__":
-            modal = CreateModal("Category")
             await category_msg.edit(content="⌛ Waiting for new category...", view=None)
             await message.channel.send("Please enter a name for the new category:", view=None)
             
@@ -507,9 +525,7 @@ async def create_definition_flow(message: discord.Message, title: str):
             category = category_view.category
         
         # Step 2: Topic Selection
-        topics = await TypologyEntry.find(
-            TypologyEntry.category == category
-        ).distinct("topic")
+        topics = await get_distinct_topics(category)
         
         topic_view = TopicSelect(topics)
         await category_msg.edit(content=f"**📝 Select a topic in '{category}'**", view=topic_view)
@@ -522,7 +538,6 @@ async def create_definition_flow(message: discord.Message, title: str):
             
         # Handle new topic creation
         if topic_view.topic == "__new__":
-            modal = CreateModal("Topic")
             await category_msg.edit(content="⌛ Waiting for new topic...", view=None)
             await message.channel.send("Please enter a name for the new topic:", view=None)
             
@@ -605,7 +620,7 @@ async def define(ctx, *, title: str = None):
     try:
         if not title:
             # Start hierarchical selection
-            categories = await TypologyEntry.distinct("category")
+            categories = await get_distinct_categories()
             if not categories:
                 await ctx.send("❌ No categories found")
                 return
@@ -619,9 +634,7 @@ async def define(ctx, *, title: str = None):
                 return
                 
             # Get topics for selected category
-            topics = await TypologyEntry.find(
-                TypologyEntry.category == view.category
-            ).distinct("topic")
+            topics = await get_distinct_topics(view.category)
             
             if not topics:
                 await msg.edit(content=f"❌ No topics found for {view.category}", view=None)
