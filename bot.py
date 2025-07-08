@@ -2,12 +2,12 @@ import os
 import asyncio
 import re
 from datetime import datetime, timezone
-from typing import List, Optional, Dict
+from typing import List, Optional
 import discord
 from discord import ui, SelectOption
 from discord.ext import commands
 from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo import IndexModel, TEXT
+from pymongo import TEXT
 from beanie import Document, init_beanie
 from pydantic import Field
 from dotenv import load_dotenv
@@ -35,7 +35,7 @@ class TypologyEntry(Document):
         name = "typology_entries"
 
 # ======================
-# DISTINCT VALUE HELPERS (CASE-INSENSITIVE)
+# DISTINCT VALUE HELPERS
 # ======================
 async def get_distinct_categories() -> List[str]:
     client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
@@ -47,7 +47,6 @@ async def get_distinct_topics(category: str) -> List[str]:
     client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
     db = client[os.getenv("MONGO_DB", "typology_bot")]
     collection = db["typology_entries"]
-    # Use exact match for better performance
     return await collection.distinct("topic", {"category": category})
 
 async def get_distinct_titles() -> List[str]:
@@ -57,25 +56,21 @@ async def get_distinct_titles() -> List[str]:
     return await collection.distinct("title")
 
 # ======================
-# DATABASE INITIALIZATION WITH MIGRATION
+# DATABASE INITIALIZATION
 # ======================
 async def initialize_database():
     client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
     db = client[os.getenv("MONGO_DB", "typology_bot")]
     
-    # Initialize Beanie with new model
     await init_beanie(database=db, document_models=[TypologyEntry])
     
-    # Migrate data from old collection if exists
     if "typology_definitions" in await db.list_collection_names():
         old_collection = db["typology_definitions"]
         new_collection = db["typology_entries"]
         
-        # Only migrate if new collection is empty
         if await new_collection.count_documents({}) == 0:
-            print("🚚 Migrating old definitions to new format...")
+            print("🚚 Migrating old definitions...")
             async for doc in old_collection.find():
-                # Map old fields to new structure with image preservation
                 new_doc = {
                     "title": doc["term"],
                     "category": "General",
@@ -85,18 +80,15 @@ async def initialize_database():
                     "author_name": doc["author_name"],
                     "created_at": doc["created_at"],
                     "last_updated": doc["last_updated"],
-                    "image_url": doc.get("image_url", ""),  # Preserve image if exists
+                    "image_url": doc.get("image_url", ""),
                     "reference": doc.get("reference", ""),
                     "votes": doc.get("votes", 0),
                     "voters": doc.get("voters", []),
                 }
                 await new_collection.insert_one(new_doc)
             
-            print(f"✅ Migrated {await old_collection.count_documents({})} entries")
-            # Rename instead of delete to keep backup
             await old_collection.rename("typology_definitions_backup")
     
-    # Create indexes
     collection = db["typology_entries"]
     await collection.create_index([("title", "text")], name="title_text_idx", default_language="english")
     await collection.create_index([("category", 1)], name="category_idx")
@@ -104,7 +96,7 @@ async def initialize_database():
     await collection.create_index([("votes", -1)], name="popularity_idx")
 
 # ======================
-# HIERARCHICAL UI COMPONENTS
+# UI COMPONENTS
 # ======================
 class CategorySelect(ui.View):
     def __init__(self, categories: List[str]):
@@ -143,7 +135,7 @@ class TopicDropdown(ui.Select):
         await interaction.response.defer()
 
 # ======================
-# ENTRY VIEW WITH EDIT/MOVE FUNCTIONALITY
+# ENTRY VIEW
 # ======================
 class EntryView(ui.View):
     def __init__(self, entries: List[TypologyEntry], user_id: int):
@@ -163,38 +155,29 @@ class EntryView(ui.View):
         
         try:
             author = await bot.fetch_user(entry.author_id)
+            author_info = author.display_name
+            avatar = author.display_avatar.url
         except:
-            author = None
+            author_info = "Unknown Author"
+            avatar = None
         
         embed = discord.Embed(
             title=f"📚 {entry.title}",
             description=entry.description,
             color=0x6A0DAD,
             timestamp=datetime.now(timezone.utc)
-        )
         
         embed.add_field(name="Category", value=f"```\n{entry.category}\n```", inline=False)
         embed.add_field(name="Topic", value=f"```\n{entry.topic}\n```", inline=False)
         
-        if author:
-            embed.set_author(name=author.display_name, icon_url=author.display_avatar.url)
-        else:
-            embed.set_author(name="Unknown Author")
-        
         if entry.reference:
             embed.add_field(name="Reference", value=f"```\n{entry.reference}\n```", inline=False)
             
-        # Display image directly in embed
         if entry.image_url:
             embed.set_image(url=entry.image_url)
             
-        footer_text = [
-            f"⭐ Votes: {entry.votes}",
-            f"🆔 ID: {entry.id}",
-            f"📅 Created: {discord.utils.format_dt(entry.created_at, style='R')}",
-            f"🔄 Updated: {discord.utils.format_dt(entry.last_updated, style='R')}"
-        ]
-        embed.set_footer(text=" • ".join(footer_text))
+        embed.set_author(name=author_info, icon_url=avatar)
+        embed.set_footer(text=f"⭐ Votes: {entry.votes} • 🆔 ID: {entry.id} • 📅 Created: {discord.utils.format_dt(entry.created_at, style='R')}")
         
         if interaction:
             await interaction.response.edit_message(embed=embed, view=self)
@@ -224,6 +207,7 @@ class EntryView(ui.View):
         entry.votes += 1
         entry.last_updated = datetime.now(timezone.utc)
         await entry.save()
+        
         await interaction.response.send_message("✅ Vote recorded!", ephemeral=True)
         await self.update_embed()
 
@@ -240,75 +224,104 @@ class EntryView(ui.View):
 
     @ui.button(emoji="🚚", style=discord.ButtonStyle.secondary)
     async def move_btn(self, interaction: discord.Interaction, button: ui.Button):
-        entry = self.entries[self.page]
-        
-        if interaction.user.id != entry.author_id:
-            await interaction.response.send_message("❌ You can only move your own entries", ephemeral=True)
-            return
+        try:
+            entry = self.entries[self.page]
             
-        await self.start_move_process(interaction, entry)
-        
-    async def start_move_process(self, interaction: discord.Interaction, entry: TypologyEntry):
-        categories = await get_distinct_categories()
-        category_view = CategorySelect(categories)
-        category_msg = await interaction.followup.send(
-            f"**📂 Select a new category for '{entry.title}'**",
-            view=category_view,
-            ephemeral=True)
-        
-        await category_view.wait()
-        if not category_view.category:
-            await category_msg.edit(content="⏱️ Category selection timed out", view=None)
-            return
+            if interaction.user.id != entry.author_id:
+                await interaction.response.send_message("❌ You can only move your own entries", ephemeral=True)
+                return
+                
+            await interaction.response.defer(ephemeral=True)
+            await self._handle_move_process(interaction, entry)
             
-        if category_view.category == "__new__":
-            await category_msg.edit(content="⌛ Waiting for new category...", view=None)
+        except Exception as e:
+            print(f"Move error: {e}")
+            await interaction.followup.send("❌ Failed to start move process", ephemeral=True)
+
+    async def _handle_move_process(self, interaction: discord.Interaction, entry: TypologyEntry):
+        try:
+            # Category selection
+            categories = await get_distinct_categories()
+            if not categories:
+                await interaction.followup.send("❌ No categories available", ephemeral=True)
+                return
+
+            category_view = CategorySelect(categories)
+            category_msg = await interaction.followup.send(
+                f"**📂 Select category for '{entry.title}'**",
+                view=category_view,
+                ephemeral=True
+            )
+            
+            await category_view.wait()
+            if not category_view.category:
+                await category_msg.edit(content="❌ Cancelled", view=None)
+                return
+                
+            if category_view.category == "__new__":
+                await category_msg.edit(content="⌛ Enter new category...", view=None)
+                category = await self._get_user_input(interaction, "Enter category name:")
+                if not category: return
+            else:
+                category = category_view.category
+
+            # Topic selection
+            topics = await get_distinct_topics(category)
+            topic_view = TopicSelect(topics)
+            await category_msg.edit(
+                content=f"**📝 Select topic in '{category}'**",
+                view=topic_view
+            )
+            
+            await topic_view.wait()
+            if not topic_view.topic:
+                await category_msg.edit(content="❌ Cancelled", view=None)
+                return
+                
+            if topic_view.topic == "__new__":
+                await category_msg.edit(content="⌛ Enter new topic...", view=None)
+                topic = await self._get_user_input(interaction, "Enter topic name:")
+                if not topic: return
+            else:
+                topic = topic_view.topic
+
+            # Update entry
+            entry.category = category
+            entry.topic = topic
+            entry.last_updated = datetime.now(timezone.utc)
+            await entry.save()
+            
+            await interaction.followup.send(f"✅ Moved to {category} → {topic}", ephemeral=True)
+            await self.update_embed()
+            
+            try:
+                await category_msg.delete()
+            except:
+                pass
+                
+        except Exception as e:
+            print(f"Move process error: {e}")
+            await interaction.followup.send("❌ Move failed", ephemeral=True)
+
+    async def _get_user_input(self, interaction: discord.Interaction, prompt: str) -> Optional[str]:
+        try:
+            await interaction.followup.send(prompt, ephemeral=True)
             
             def check(m):
                 return m.author == interaction.user and m.channel == interaction.channel
                 
-            try:
-                await interaction.followup.send("Please enter a name for the new category:", ephemeral=True)
-                response = await bot.wait_for('message', timeout=60.0, check=check)
-                category = response.content.strip()
-                await response.delete()
-            except asyncio.TimeoutError:
-                await interaction.followup.send("⌛ Category creation timed out", ephemeral=True)
-                return
-        else:
-            category = category_view.category
-        
-        topics = await get_distinct_topics(category)
-        topic_view = TopicSelect(topics)
-        await category_msg.edit(content=f"**📝 Select a topic in '{category}'**", view=topic_view)
-        
-        await topic_view.wait()
-        if not topic_view.topic:
-            await category_msg.edit(content="⏱️ Topic selection timed out", view=None)
-            return
+            response = await bot.wait_for('message', timeout=60.0, check=check)
+            content = response.content.strip()
+            await response.delete()
+            return content
             
-        if topic_view.topic == "__new__":
-            await category_msg.edit(content="⌛ Waiting for new topic...", view=None)
-            
-            try:
-                await interaction.followup.send("Please enter a name for the new topic:", ephemeral=True)
-                response = await bot.wait_for('message', timeout=60.0, check=check)
-                topic = response.content.strip()
-                await response.delete()
-            except asyncio.TimeoutError:
-                await interaction.followup.send("⌛ Topic creation timed out", ephemeral=True)
-                return
-        else:
-            topic = topic_view.topic
-        
-        entry.category = category
-        entry.topic = topic
-        entry.last_updated = datetime.now(timezone.utc)
-        await entry.save()
-        
-        await interaction.followup.send(f"✅ Entry moved to **{category} → {topic}**", ephemeral=True)
-        await self.update_embed()
-        await category_msg.delete()
+        except asyncio.TimeoutError:
+            await interaction.followup.send("⌛ Timed out", ephemeral=True)
+            return None
+        except Exception as e:
+            print(f"Input error: {e}")
+            await interaction.followup.send("❌ Invalid input", ephemeral=True)
+            return None
 
     @ui.button(emoji="🗑️", style=discord.ButtonStyle.red)
     async def delete_btn(self, interaction: discord.Interaction, button: ui.Button):
@@ -326,7 +339,7 @@ class EntryView(ui.View):
         self.entries.pop(self.page)
         
         if not self.entries:
-            await interaction.response.edit_message(content=f"✅ Entry deleted", embed=None, view=None)
+            await interaction.response.edit_message(content="✅ Entry deleted", embed=None, view=None)
             return
             
         if self.page >= len(self.entries):
@@ -342,7 +355,7 @@ class EntryView(ui.View):
             await self.message.edit(view=self)
 
 # ======================
-# EDIT MODAL (CONTENT ONLY)
+# EDIT MODAL
 # ======================
 class EditModal(ui.Modal, title="Edit Entry Content"):
     new_description = ui.TextInput(label="Description", style=discord.TextStyle.long, required=True)
@@ -363,7 +376,6 @@ class EditModal(ui.Modal, title="Edit Entry Content"):
         self.entry.last_updated = datetime.now(timezone.utc)
         await self.entry.save()
         
-        # Show image preview if URL was changed
         if self.entry.image_url:
             preview_embed = discord.Embed(title="Image Preview", color=0x3498DB)
             preview_embed.set_image(url=self.entry.image_url)
@@ -376,57 +388,32 @@ class EditModal(ui.Modal, title="Edit Entry Content"):
             await interaction.response.send_message("✅ Content updated!", ephemeral=True)
 
 # ======================
-# BOT SETUP
-# ======================
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-@bot.event
-async def on_ready():
-    max_retries = 3
-    for attempt in range(1, max_retries + 1):
-        try:
-            print(f"🔄 Database initialization attempt {attempt}/{max_retries}")
-            await initialize_database()
-            print(f"✅ Bot ready as {bot.user}")
-            break
-        except Exception as e:
-            print(f"❌ Attempt {attempt} failed: {str(e)}")
-            if attempt == max_retries:
-                print("💥 Failed to initialize database after 3 attempts")
-                raise
-            await asyncio.sleep(2 ** attempt)
-
-# ======================
-# DEFINITION CREATION FLOW (CASE-INSENSITIVE & MULTI-WORD)
+# DEFINITION CREATION FLOW
 # ======================
 async def create_definition_flow(message: discord.Message):
     try:
-        # Extract multi-word title (case-insensitive)
+        # Extract title (case-insensitive)
         title = re.sub(r'^tp define\s*', '', message.content, flags=re.IGNORECASE).strip()
         if not title:
             await message.channel.send("❌ Please provide a title after `tp define`")
             return
             
-        # Check for existing title (case-insensitive)
+        # Check for existing title
         existing = await TypologyEntry.find_one({
             "title": {"$regex": f"^{re.escape(title)}$", "$options": "i"}
         })
-        
         if existing:
             await message.channel.send(f"⚠️ An entry with title '{title}' already exists")
             return
         
-        # Step 1: Category Selection
+        # Category selection
         categories = await get_distinct_categories()
         category_view = CategorySelect(categories)
         category_msg = await message.channel.send(f"**📂 Select a category for '{title}'**", view=category_view)
         
         await category_view.wait()
         if not category_view.category:
-            await category_msg.edit(content="⏱️ Category selection timed out", view=None)
+            await category_msg.edit(content="❌ Category selection cancelled", view=None)
             return
             
         if category_view.category == "__new__":
@@ -446,14 +433,14 @@ async def create_definition_flow(message: discord.Message):
         else:
             category = category_view.category
         
-        # Step 2: Topic Selection
+        # Topic selection
         topics = await get_distinct_topics(category)
         topic_view = TopicSelect(topics)
         await category_msg.edit(content=f"**📝 Select a topic in '{category}'**", view=topic_view)
         
         await topic_view.wait()
         if not topic_view.topic:
-            await category_msg.edit(content="⏱️ Topic selection timed out", view=None)
+            await category_msg.edit(content="❌ Topic selection cancelled", view=None)
             return
             
         if topic_view.topic == "__new__":
@@ -470,7 +457,7 @@ async def create_definition_flow(message: discord.Message):
         else:
             topic = topic_view.topic
         
-        # Step 3: Get content from replied message
+        # Get content from replied message
         if not message.reference:
             await message.channel.send("❌ Please reply to a message with the content")
             return
@@ -486,7 +473,7 @@ async def create_definition_flow(message: discord.Message):
             await message.channel.send("❌ Failed to fetch content message")
             return
             
-        # Step 4: Create entry
+        # Create entry
         entry = TypologyEntry(
             title=title,
             category=category,
@@ -511,13 +498,29 @@ async def create_definition_flow(message: discord.Message):
         await message.channel.send(f"❌ Error in creation flow: {str(e)}")
 
 # ======================
-# MESSAGE HANDLING (CASE-INSENSITIVE)
+# BOT SETUP
+# ======================
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+@bot.event
+async def on_ready():
+    print(f"🔄 Initializing database...")
+    try:
+        await initialize_database()
+        print(f"✅ Bot ready as {bot.user}")
+    except Exception as e:
+        print(f"❌ Database init failed: {e}")
+
+# ======================
+# MESSAGE HANDLING
 # ======================
 @bot.event
 async def on_message(message):
     await bot.process_commands(message)
     
-    # Case-insensitive command matching
     if re.match(r'^tp define\b', message.content, re.IGNORECASE) and not message.author.bot:
         await create_definition_flow(message)
 
@@ -529,7 +532,7 @@ async def define(ctx, *, title: str = None):
     """Browse entries through a hierarchical interface"""
     try:
         if not title:
-            # Start hierarchical selection
+            # Hierarchical browsing
             categories = await get_distinct_categories()
             if not categories:
                 await ctx.send("❌ No categories found")
@@ -543,9 +546,7 @@ async def define(ctx, *, title: str = None):
                 await msg.edit(content="❌ Category selection cancelled", view=None)
                 return
                 
-            # Get topics for selected category
             topics = await get_distinct_topics(view.category)
-            
             if not topics:
                 await msg.edit(content=f"❌ No topics found for {view.category}", view=None)
                 return
@@ -558,7 +559,6 @@ async def define(ctx, *, title: str = None):
                 await msg.edit(content="❌ Topic selection cancelled", view=None)
                 return
                 
-            # Get entries for selected topic
             entries = await TypologyEntry.find(
                 TypologyEntry.category == view.category,
                 TypologyEntry.topic == topic_view.topic
@@ -568,7 +568,6 @@ async def define(ctx, *, title: str = None):
                 await msg.edit(content=f"❌ No entries found for {view.category}/{topic_view.topic}", view=None)
                 return
                 
-            # Show entries
             entry_view = EntryView(entries, ctx.author.id)
             entry_view.message = await ctx.send(
                 embed=discord.Embed(
@@ -581,7 +580,7 @@ async def define(ctx, *, title: str = None):
             await msg.delete()
             
         else:
-            # Direct title search (case-insensitive)
+            # Direct title search
             entries = await TypologyEntry.find({
                 "title": {"$regex": f"^{re.escape(title)}$", "$options": "i"}
             }).sort(-TypologyEntry.votes).to_list()
@@ -615,7 +614,6 @@ async def search(ctx, *, query: str):
             await ctx.send("🔍 No results found")
             return
             
-        # Create view with search results
         view = EntryView(results, ctx.author.id)
         view.message = await ctx.send(
             embed=discord.Embed(
