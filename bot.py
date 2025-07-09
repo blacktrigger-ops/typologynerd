@@ -136,7 +136,7 @@ class ConfirmButton(ui.Button):
             await interaction.followup.send("❌ Failed to complete deletion", ephemeral=True)
 
 # ======================
-# ENTRY VIEW
+# ENTRY VIEW WITH FIXED FORMATTING
 # ======================
 class EntryView(ui.View):
     def __init__(self, entries: List[TypologyEntry], user_id: int):
@@ -155,33 +155,47 @@ class EntryView(ui.View):
         entry = self.entries[self.page]
         
         try:
-            author = await bot.fetch_user(entry.author_id)
-            author_name = author.display_name
-            avatar_url = author.display_avatar.url
-        except:
-            author_name = "Unknown Author"
+            # Fetch user with proper avatar handling
+            user = await bot.fetch_user(entry.author_id)
+            author_name = user.display_name
+            avatar_url = str(user.display_avatar.url)
+        except Exception as e:
+            print(f"Error fetching user: {e}")
+            author_name = entry.author_name
             avatar_url = None
         
         embed = discord.Embed(
             title=f"📚 {entry.title}",
+            description=entry.description,  # Main description remains unchanged
             color=0x6A0DAD,
-            timestamp=datetime.now(timezone.utc))
+            timestamp=datetime.now(timezone.utc)
+        )
         
-        # Formatted description with different fonts
-        description_parts = [
-            f"```fix\n{entry.description}\n```",  # Highlighted main description
-            f"**Category:** `{entry.category}`",
-            f"**Topic:** `{entry.topic}`"
-        ]
+        # Add formatted fields
+        embed.add_field(
+            name="Category",
+            value=f"`{entry.category}`",
+            inline=False
+        )
+        embed.add_field(
+            name="Topic",
+            value=f"`{entry.topic}`",
+            inline=False
+        )
         
         if entry.reference:
-            description_parts.append(f"**Reference:** ```\n{entry.reference}\n```")
+            embed.add_field(
+                name="Reference",
+                value=f"**{entry.reference}**",
+                inline=False
+            )
             
-        embed.description = "\n".join(description_parts)
-        
-        # Set author with avatar
+        # Set author with profile picture
         if avatar_url:
-            embed.set_author(name=author_name, icon_url=avatar_url)
+            embed.set_author(
+                name=author_name,
+                icon_url=avatar_url
+            )
         else:
             embed.set_author(name=author_name)
             
@@ -192,7 +206,8 @@ class EntryView(ui.View):
         footer_text = [
             f"⭐ Votes: {entry.votes}",
             f"🆔 ID: {entry.id}",
-            f"📅 Created: {discord.utils.format_dt(entry.created_at, style='R')}"
+            f"📅 Created: {discord.utils.format_dt(entry.created_at, style='R')}",
+            f"🔄 Updated: {discord.utils.format_dt(entry.last_updated, style='R')}"
         ]
         embed.set_footer(text=" • ".join(footer_text))
         
@@ -256,8 +271,9 @@ class EntryView(ui.View):
             await interaction.followup.send("❌ Failed to start move process", ephemeral=True)
 
     async def _execute_move_process(self, interaction: discord.Interaction, entry: TypologyEntry):
+        """Complete move process with proper error handling"""
         try:
-            # Category selection
+            # Step 1: Category Selection
             categories = await get_distinct_categories()
             if not categories:
                 await interaction.followup.send("❌ No categories available", ephemeral=True)
@@ -283,7 +299,7 @@ class EntryView(ui.View):
             else:
                 category = category_view.category
 
-            # Topic selection
+            # Step 2: Topic Selection
             topics = await get_distinct_topics(category)
             topic_view = TopicSelect(topics)
             await category_msg.edit(
