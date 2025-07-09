@@ -49,52 +49,6 @@ async def get_distinct_topics(category: str) -> List[str]:
     collection = db["typology_entries"]
     return await collection.distinct("topic", {"category": category})
 
-async def get_distinct_titles() -> List[str]:
-    client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
-    db = client[os.getenv("MONGO_DB", "typology_bot")]
-    collection = db["typology_entries"]
-    return await collection.distinct("title")
-
-# ======================
-# DATABASE INITIALIZATION
-# ======================
-async def initialize_database():
-    client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
-    db = client[os.getenv("MONGO_DB", "typology_bot")]
-    
-    await init_beanie(database=db, document_models=[TypologyEntry])
-    
-    if "typology_definitions" in await db.list_collection_names():
-        old_collection = db["typology_definitions"]
-        new_collection = db["typology_entries"]
-        
-        if await new_collection.count_documents({}) == 0:
-            print("🚚 Migrating old definitions...")
-            async for doc in old_collection.find():
-                new_doc = {
-                    "title": doc["term"],
-                    "category": "General",
-                    "topic": "General",
-                    "description": doc["text"],
-                    "author_id": doc["author_id"],
-                    "author_name": doc["author_name"],
-                    "created_at": doc["created_at"],
-                    "last_updated": doc["last_updated"],
-                    "image_url": doc.get("image_url", ""),
-                    "reference": doc.get("reference", ""),
-                    "votes": doc.get("votes", 0),
-                    "voters": doc.get("voters", []),
-                }
-                await new_collection.insert_one(new_doc)
-            
-            await old_collection.rename("typology_definitions_backup")
-    
-    collection = db["typology_entries"]
-    await collection.create_index([("title", "text")], name="title_text_idx", default_language="english")
-    await collection.create_index([("category", 1)], name="category_idx")
-    await collection.create_index([("topic", 1)], name="topic_idx")
-    await collection.create_index([("votes", -1)], name="popularity_idx")
-
 # ======================
 # UI COMPONENTS
 # ======================
@@ -134,6 +88,53 @@ class TopicDropdown(ui.Select):
         self.view.stop()
         await interaction.response.defer()
 
+class ConfirmButton(ui.Button):
+    def __init__(self, delete_type: str, name: str):
+        super().__init__(
+            label=f"Delete {delete_type}",
+            style=discord.ButtonStyle.danger,
+            emoji="⚠️"
+        )
+        self.delete_type = delete_type
+        self.name = name
+    
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.defer(ephemeral=True)
+            
+            if self.delete_type == "category":
+                entries = await TypologyEntry.find(
+                    TypologyEntry.category == self.name
+                ).to_list()
+                
+                for entry in entries:
+                    entry.category = "General"
+                    entry.topic = "General"
+                    await entry.save()
+                
+                await interaction.followup.send(
+                    f"✅ Moved {len(entries)} entries from '{self.name}' to General",
+                    ephemeral=True
+                )
+                
+            elif self.delete_type == "topic":
+                entries = await TypologyEntry.find(
+                    TypologyEntry.topic == self.name
+                ).to_list()
+                
+                for entry in entries:
+                    entry.topic = "General"
+                    await entry.save()
+                
+                await interaction.followup.send(
+                    f"✅ Moved {len(entries)} entries from topic '{self.name}' to General",
+                    ephemeral=True
+                )
+                
+        except Exception as e:
+            print(f"Deletion error: {e}")
+            await interaction.followup.send("❌ Failed to complete deletion", ephemeral=True)
+
 # ======================
 # ENTRY VIEW
 # ======================
@@ -155,30 +156,45 @@ class EntryView(ui.View):
         
         try:
             author = await bot.fetch_user(entry.author_id)
-            author_info = author.display_name
-            avatar = author.display_avatar.url
+            author_name = author.display_name
+            avatar_url = author.display_avatar.url
         except:
-            author_info = "Unknown Author"
-            avatar = None
+            author_name = "Unknown Author"
+            avatar_url = None
         
         embed = discord.Embed(
             title=f"📚 {entry.title}",
-            description=entry.description,
             color=0x6A0DAD,
             timestamp=datetime.now(timezone.utc)
-        )
         
-        embed.add_field(name="Category", value=f"```\n{entry.category}\n```", inline=False)
-        embed.add_field(name="Topic", value=f"```\n{entry.topic}\n```", inline=False)
+        # Formatted description with different fonts
+        description_parts = [
+            f"```fix\n{entry.description}\n```",  # Highlighted main description
+            f"**Category:** `{entry.category}`",
+            f"**Topic:** `{entry.topic}`"
+        ]
         
         if entry.reference:
-            embed.add_field(name="Reference", value=f"```\n{entry.reference}\n```", inline=False)
+            description_parts.append(f"**Reference:** ```\n{entry.reference}\n```")
+            
+        embed.description = "\n".join(description_parts)
+        
+        # Set author with avatar
+        if avatar_url:
+            embed.set_author(name=author_name, icon_url=avatar_url)
+        else:
+            embed.set_author(name=author_name)
             
         if entry.image_url:
             embed.set_image(url=entry.image_url)
             
-        embed.set_author(name=author_info, icon_url=avatar)
-        embed.set_footer(text=f"⭐ Votes: {entry.votes} • 🆔 ID: {entry.id} • 📅 Created: {discord.utils.format_dt(entry.created_at, style='R')}")
+        # Footer with metadata
+        footer_text = [
+            f"⭐ Votes: {entry.votes}",
+            f"🆔 ID: {entry.id}",
+            f"📅 Created: {discord.utils.format_dt(entry.created_at, style='R')}"
+        ]
+        embed.set_footer(text=" • ".join(footer_text))
         
         if interaction:
             await interaction.response.edit_message(embed=embed, view=self)
@@ -240,9 +256,8 @@ class EntryView(ui.View):
             await interaction.followup.send("❌ Failed to start move process", ephemeral=True)
 
     async def _execute_move_process(self, interaction: discord.Interaction, entry: TypologyEntry):
-        """Complete move process with proper error handling"""
         try:
-            # Step 1: Category Selection
+            # Category selection
             categories = await get_distinct_categories()
             if not categories:
                 await interaction.followup.send("❌ No categories available", ephemeral=True)
@@ -268,7 +283,7 @@ class EntryView(ui.View):
             else:
                 category = category_view.category
 
-            # Step 2: Topic Selection
+            # Topic selection
             topics = await get_distinct_topics(category)
             topic_view = TopicSelect(topics)
             await category_msg.edit(
@@ -307,8 +322,36 @@ class EntryView(ui.View):
             print(f"Move process error: {e}")
             await interaction.followup.send("❌ Move failed", ephemeral=True)
 
+    @ui.button(emoji="🧹", style=discord.ButtonStyle.danger)
+    async def delete_category_btn(self, interaction: discord.Interaction, button: ui.Button):
+        """Delete entire category/topic and move entries to General"""
+        try:
+            entry = self.entries[self.page]
+            
+            # Check moderator permissions
+            MOD_ROLE_ID = int(os.getenv("MOD_ROLE_ID", 0))
+            if not MOD_ROLE_ID or not any(role.id == MOD_ROLE_ID for role in interaction.user.roles):
+                await interaction.response.send_message("❌ Only moderators can delete categories", ephemeral=True)
+                return
+                
+            await interaction.response.defer(ephemeral=True)
+            
+            # Create confirmation view
+            confirm_view = ui.View()
+            confirm_view.add_item(ConfirmButton("category", entry.category))
+            confirm_view.add_item(ConfirmButton("topic", entry.topic))
+            
+            await interaction.followup.send(
+                f"⚠️ Delete which for '{entry.title}'?",
+                view=confirm_view,
+                ephemeral=True
+            )
+            
+        except Exception as e:
+            print(f"Delete category error: {e}")
+            await interaction.followup.send("❌ Failed to start deletion process", ephemeral=True)
+
     async def _get_text_input(self, interaction: discord.Interaction, prompt: str) -> Optional[str]:
-        """Helper to get text input from user"""
         try:
             await interaction.followup.send(prompt, ephemeral=True)
             
@@ -401,122 +444,52 @@ class EditModal(ui.Modal, title="Edit Entry Content"):
             await interaction.response.send_message("✅ Content updated!", ephemeral=True)
 
 # ======================
-# DEFINITION CREATION FLOW
-# ======================
-async def create_definition_flow(message: discord.Message):
-    try:
-        # Extract title (case-insensitive)
-        title = re.sub(r'^tp define\s*', '', message.content, flags=re.IGNORECASE).strip()
-        if not title:
-            await message.channel.send("❌ Please provide a title after `tp define`")
-            return
-            
-        # Check for existing title
-        existing = await TypologyEntry.find_one({
-            "title": {"$regex": f"^{re.escape(title)}$", "$options": "i"}
-        })
-        if existing:
-            await message.channel.send(f"⚠️ An entry with title '{title}' already exists")
-            return
-        
-        # Category selection
-        categories = await get_distinct_categories()
-        category_view = CategorySelect(categories)
-        category_msg = await message.channel.send(f"**📂 Select a category for '{title}'**", view=category_view)
-        
-        await category_view.wait()
-        if not category_view.category:
-            await category_msg.edit(content="❌ Category selection cancelled", view=None)
-            return
-            
-        if category_view.category == "__new__":
-            await category_msg.edit(content="⌛ Waiting for new category...", view=None)
-            
-            def check(m):
-                return m.author == message.author and m.channel == message.channel
-                
-            try:
-                await message.channel.send("Please enter a name for the new category:")
-                response = await bot.wait_for('message', timeout=60.0, check=check)
-                category = response.content.strip()
-                await response.delete()
-            except asyncio.TimeoutError:
-                await message.channel.send("⌛ Category creation timed out")
-                return
-        else:
-            category = category_view.category
-        
-        # Topic selection
-        topics = await get_distinct_topics(category)
-        topic_view = TopicSelect(topics)
-        await category_msg.edit(content=f"**📝 Select a topic in '{category}'**", view=topic_view)
-        
-        await topic_view.wait()
-        if not topic_view.topic:
-            await category_msg.edit(content="❌ Topic selection cancelled", view=None)
-            return
-            
-        if topic_view.topic == "__new__":
-            await category_msg.edit(content="⌛ Waiting for new topic...", view=None)
-            
-            try:
-                await message.channel.send("Please enter a name for the new topic:")
-                response = await bot.wait_for('message', timeout=60.0, check=check)
-                topic = response.content.strip()
-                await response.delete()
-            except asyncio.TimeoutError:
-                await message.channel.send("⌛ Topic creation timed out")
-                return
-        else:
-            topic = topic_view.topic
-        
-        # Get content from replied message
-        if not message.reference:
-            await message.channel.send("❌ Please reply to a message with the content")
-            return
-            
-        try:
-            content_msg = await message.channel.fetch_message(message.reference.message_id)
-            if content_msg.author.bot:
-                await message.channel.send("❌ Cannot use bot messages as content")
-                return
-                
-            description = content_msg.content
-        except:
-            await message.channel.send("❌ Failed to fetch content message")
-            return
-            
-        # Create entry
-        entry = TypologyEntry(
-            title=title,
-            category=category,
-            topic=topic,
-            description=description,
-            author_id=message.author.id,
-            author_name=message.author.display_name
-        )
-        await entry.insert()
-        
-        # Send confirmation
-        embed = discord.Embed(
-            title=f"✅ Entry created: {title}",
-            description=f"**{category} → {topic}**\n{description[:200]}...",
-            color=0x00ff00
-        )
-        embed.add_field(name="Full Content", value=f"[Jump to Message]({content_msg.jump_url})")
-        await message.channel.send(embed=embed)
-        await category_msg.delete()
-        
-    except Exception as e:
-        await message.channel.send(f"❌ Error in creation flow: {str(e)}")
-
-# ======================
 # BOT SETUP
 # ======================
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# ======================
+# DATABASE INITIALIZATION
+# ======================
+async def initialize_database():
+    client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
+    db = client[os.getenv("MONGO_DB", "typology_bot")]
+    
+    await init_beanie(database=db, document_models=[TypologyEntry])
+    
+    if "typology_definitions" in await db.list_collection_names():
+        old_collection = db["typology_definitions"]
+        new_collection = db["typology_entries"]
+        
+        if await new_collection.count_documents({}) == 0:
+            print("🚚 Migrating old definitions...")
+            async for doc in old_collection.find():
+                new_doc = {
+                    "title": doc["term"],
+                    "category": "General",
+                    "topic": "General",
+                    "description": doc["text"],
+                    "author_id": doc["author_id"],
+                    "author_name": doc["author_name"],
+                    "created_at": doc["created_at"],
+                    "last_updated": doc["last_updated"],
+                    "image_url": doc.get("image_url", ""),
+                    "reference": doc.get("reference", ""),
+                    "votes": doc.get("votes", 0),
+                    "voters": doc.get("voters", []),
+                }
+                await new_collection.insert_one(new_doc)
+            
+            await old_collection.rename("typology_definitions_backup")
+    
+    collection = db["typology_entries"]
+    await collection.create_index([("title", "text")], name="title_text_idx", default_language="english")
+    await collection.create_index([("category", 1)], name="category_idx")
+    await collection.create_index([("topic", 1)], name="topic_idx")
+    await collection.create_index([("votes", -1)], name="popularity_idx")
 
 @bot.event
 async def on_ready():
@@ -528,18 +501,45 @@ async def on_ready():
         print(f"❌ Database init failed: {e}")
 
 # ======================
-# MESSAGE HANDLING
-# ======================
-@bot.event
-async def on_message(message):
-    await bot.process_commands(message)
-    
-    if re.match(r'^tp define\b', message.content, re.IGNORECASE) and not message.author.bot:
-        await create_definition_flow(message)
-
-# ======================
 # COMMANDS
 # ======================
+@bot.command()
+@commands.has_permissions(manage_messages=True)
+async def delete_category(ctx, category: str):
+    """Delete a category and move all entries to General (Mod only)"""
+    try:
+        entries = await TypologyEntry.find(
+            TypologyEntry.category == category
+        ).to_list()
+        
+        for entry in entries:
+            entry.category = "General"
+            entry.topic = "General"
+            await entry.save()
+        
+        await ctx.send(f"✅ Moved {len(entries)} entries from '{category}' to General")
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error: {str(e)}")
+
+@bot.command()
+@commands.has_permissions(manage_messages=True)
+async def delete_topic(ctx, topic: str):
+    """Delete a topic and move all entries to General (Mod only)"""
+    try:
+        entries = await TypologyEntry.find(
+            TypologyEntry.topic == topic
+        ).to_list()
+        
+        for entry in entries:
+            entry.topic = "General"
+            await entry.save()
+        
+        await ctx.send(f"✅ Moved {len(entries)} entries from topic '{topic}' to General")
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error: {str(e)}")
+
 @bot.command()
 async def define(ctx, *, title: str = None):
     """Browse entries through a hierarchical interface"""
@@ -640,6 +640,122 @@ async def search(ctx, *, query: str):
         await ctx.send(f"❌ Search error: {str(e)}")
 
 # ======================
+# MESSAGE HANDLING
+# ======================
+@bot.event
+async def on_message(message):
+    await bot.process_commands(message)
+    
+    if re.match(r'^tp define\b', message.content, re.IGNORECASE) and not message.author.bot:
+        await create_definition_flow(message)
+
+async def create_definition_flow(message: discord.Message):
+    try:
+        # Extract title (case-insensitive)
+        title = re.sub(r'^tp define\s*', '', message.content, flags=re.IGNORECASE).strip()
+        if not title:
+            await message.channel.send("❌ Please provide a title after `tp define`")
+            return
+            
+        # Check for existing title
+        existing = await TypologyEntry.find_one({
+            "title": {"$regex": f"^{re.escape(title)}$", "$options": "i"}
+        })
+        if existing:
+            await message.channel.send(f"⚠️ An entry with title '{title}' already exists")
+            return
+        
+        # Category selection
+        categories = await get_distinct_categories()
+        category_view = CategorySelect(categories)
+        category_msg = await message.channel.send(f"**📂 Select a category for '{title}'**", view=category_view)
+        
+        await category_view.wait()
+        if not category_view.category:
+            await category_msg.edit(content="❌ Category selection cancelled", view=None)
+            return
+            
+        if category_view.category == "__new__":
+            await category_msg.edit(content="⌛ Waiting for new category...", view=None)
+            
+            def check(m):
+                return m.author == message.author and m.channel == message.channel
+                
+            try:
+                await message.channel.send("Please enter a name for the new category:")
+                response = await bot.wait_for('message', timeout=60.0, check=check)
+                category = response.content.strip()
+                await response.delete()
+            except asyncio.TimeoutError:
+                await message.channel.send("⌛ Category creation timed out")
+                return
+        else:
+            category = category_view.category
+        
+        # Topic selection
+        topics = await get_distinct_topics(category)
+        topic_view = TopicSelect(topics)
+        await category_msg.edit(content=f"**📝 Select a topic in '{category}'**", view=topic_view)
+        
+        await topic_view.wait()
+        if not topic_view.topic:
+            await category_msg.edit(content="❌ Topic selection cancelled", view=None)
+            return
+            
+        if topic_view.topic == "__new__":
+            await category_msg.edit(content="⌛ Waiting for new topic...", view=None)
+            
+            try:
+                await message.channel.send("Please enter a name for the new topic:")
+                response = await bot.wait_for('message', timeout=60.0, check=check)
+                topic = response.content.strip()
+                await response.delete()
+            except asyncio.TimeoutError:
+                await message.channel.send("⌛ Topic creation timed out")
+                return
+        else:
+            topic = topic_view.topic
+        
+        # Get content from replied message
+        if not message.reference:
+            await message.channel.send("❌ Please reply to a message with the content")
+            return
+            
+        try:
+            content_msg = await message.channel.fetch_message(message.reference.message_id)
+            if content_msg.author.bot:
+                await message.channel.send("❌ Cannot use bot messages as content")
+                return
+                
+            description = content_msg.content
+        except:
+            await message.channel.send("❌ Failed to fetch content message")
+            return
+            
+        # Create entry
+        entry = TypologyEntry(
+            title=title,
+            category=category,
+            topic=topic,
+            description=description,
+            author_id=message.author.id,
+            author_name=message.author.display_name
+        )
+        await entry.insert()
+        
+        # Send confirmation
+        embed = discord.Embed(
+            title=f"✅ Entry created: {title}",
+            description=f"**{category} → {topic}**\n{description[:200]}...",
+            color=0x00ff00
+        )
+        await message.channel.send(embed=embed)
+        await category_msg.delete()
+        
+    except Exception as e:
+        await message.channel.send(f"❌ Error in creation flow: {str(e)}")
+
+# ======================
 # START BOT
 # ======================
 if __name__ == "__main__":
@@ -647,9 +763,6 @@ if __name__ == "__main__":
     if missing := [var for var in required_vars if not os.getenv(var)]:
         print(f"❌ Missing environment variables: {', '.join(missing)}")
         exit(1)
-    
-    if not os.getenv("MOD_ROLE_ID"):
-        print("⚠️ MOD_ROLE_ID not set - moderator deletion disabled")
     
     try:
         bot.run(os.getenv("DISCORD_TOKEN"))
