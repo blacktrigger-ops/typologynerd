@@ -423,8 +423,17 @@ class EntryView(ui.View):
     async def on_timeout(self):
         for item in self.children:
             item.disabled = True
-        if self.message:
+        
+        if not self.message:
+            return
+            
+        try:
             await self.message.edit(view=self)
+        except discord.NotFound:
+            # Message was already deleted, no action needed
+            pass
+        except discord.HTTPException as e:
+            print(f"Failed to disable buttons on timeout: {e}")
 
 # ======================
 # EDIT MODAL
@@ -471,41 +480,82 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # DATABASE INITIALIZATION
 # ======================
 async def initialize_database():
-    client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
-    db = client[os.getenv("MONGO_DB", "typology_bot")]
+    max_retries = 3
+    retry_delay = 2
     
-    await init_beanie(database=db, document_models=[TypologyEntry])
-    
-    if "typology_definitions" in await db.list_collection_names():
-        old_collection = db["typology_definitions"]
-        new_collection = db["typology_entries"]
-        
-        if await new_collection.count_documents({}) == 0:
-            print("🚚 Migrating old definitions...")
-            async for doc in old_collection.find():
-                new_doc = {
-                    "title": doc["term"],
-                    "category": "General",
-                    "topic": "General",
-                    "description": doc["text"],
-                    "author_id": doc["author_id"],
-                    "author_name": doc["author_name"],
-                    "created_at": doc["created_at"],
-                    "last_updated": doc["last_updated"],
-                    "image_url": doc.get("image_url", ""),
-                    "reference": doc.get("reference", ""),
-                    "votes": doc.get("votes", 0),
-                    "voters": doc.get("voters", []),
-                }
-                await new_collection.insert_one(new_doc)
+    for attempt in range(max_retries):
+        try:
+            client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
+            db = client[os.getenv("MONGO_DB", "typology_bot")]
             
-            await old_collection.rename("typology_definitions_backup")
-    
-    collection = db["typology_entries"]
-    await collection.create_index([("title", "text")], name="title_text_idx", default_language="english")
-    await collection.create_index([("category", 1)], name="category_idx")
-    await collection.create_index([("topic", 1)], name="topic_idx")
-    await collection.create_index([("votes", -1)], name="popularity_idx")
+            # Test connection
+            await db.command('ping')
+            
+            await init_beanie(database=db, document_models=[TypologyEntry])
+            
+            # Migration logic
+            if "typology_definitions" in await db.list_collection_names():
+                old_collection = db["typology_definitions"]
+                new_collection = db["typology_entries"]
+                
+                if await new_collection.count_documents({}) == 0:
+                    print("🚚 Migrating old definitions...")
+                    async for doc in old_collection.find():
+                        new_doc = {
+                            "title": doc["term"],
+                            "category": "General",
+                            "topic": "General",
+                            "description": doc["text"],
+                            "author_id": doc["author_id"],
+                            "author_name": doc["author_name"],
+                            "created_at": doc["created_at"],
+                            "last_updated": doc["last_updated"],
+                            "image_url": doc.get("image_url", ""),
+                            "reference": doc.get("reference", ""),
+                            "votes": doc.get("votes", 0),
+                            "voters": doc.get("voters", []),
+                        }
+                        await new_collection.insert_one(new_doc)
+                    
+                    await old_collection.rename("typology_definitions_backup")
+            
+            # Index management
+            collection = db["typology_entries"]
+            existing_indexes = await collection.index_information()
+            
+            # Create text index only if none exists
+            if not any(idx.get('key', {}).get('_fts') == 'text' for idx in existing_indexes.values()):
+                try:
+                    await collection.create_index(
+                        [("title", "text")],
+                        name="title_text_idx",
+                        default_language="english"
+                    )
+                except Exception as e:
+                    print(f"Warning: Could not create text index: {e}")
+            
+            # Create other indexes
+            index_ops = [
+                ([("category", 1)], "category_idx"),
+                ([("topic", 1)], "topic_idx"),
+                ([("votes", -1)], "popularity_idx")
+            ]
+            
+            for keys, name in index_ops:
+                if name not in existing_indexes:
+                    try:
+                        await collection.create_index(keys, name=name)
+                    except Exception as e:
+                        print(f"Warning: Could not create index {name}: {e}")
+            
+            return  # Success
+        
+        except Exception as e:
+            print(f"Database initialization attempt {attempt + 1} failed: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(retry_delay)
+            else:
+                raise RuntimeError(f"Failed to initialize database after {max_retries} attempts") from e
 
 @bot.event
 async def on_ready():
