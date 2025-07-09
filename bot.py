@@ -165,7 +165,7 @@ class EntryView(ui.View):
         embed = discord.Embed(
             title=f"📚 {entry.title}",
             color=0x6A0DAD,
-            timestamp=datetime.now(timezone.utc)
+            timestamp=datetime.now(timezone.utc))
         
         # Formatted description with different fonts
         description_parts = [
