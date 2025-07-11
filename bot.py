@@ -731,6 +731,10 @@ async def create_definition_flow(message: discord.Message):
             await message.channel.send(f"⚠️ An entry with title '{title}' already exists")
             return
         
+        # Define check function here so it's accessible in both blocks
+        def check(m):
+            return m.author == message.author and m.channel == message.channel
+        
         # Category selection
         categories = await get_distinct_categories()
         category_view = CategorySelect(categories)
@@ -744,9 +748,6 @@ async def create_definition_flow(message: discord.Message):
         if category_view.category == "__new__":
             await category_msg.edit(content="⌛ Waiting for new category...", view=None)
             
-            def check(m):
-                return m.author == message.author and m.channel == message.channel
-                
             try:
                 await message.channel.send("Please enter a name for the new category:")
                 response = await bot.wait_for('message', timeout=60.0, check=check)
